@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fachfinder</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='3' y='5' width='26' height='22' rx='3' fill='%23ff9f43'/><path d='M3 16h26M12 5v22M21 5v22' stroke='%2314171c' stroke-width='2'/></svg>">
+  <link rel="stylesheet" href="static/style.css">
+  <script type="importmap">
+    { "imports": { "three": "./static/vendor/three.module.js", "three/addons/": "./static/vendor/addons/" } }
+  </script>
+</head>
+<body>
+  <header>
+    <button class="icon-btn only-mobile" id="toggle-tree" title="Struktur">☰</button>
+    <div class="brand">
+      <svg viewBox="0 0 32 32" width="22" height="22"><rect x="3" y="5" width="26" height="22" rx="3" fill="#ff9f43"/><path d="M3 16h26M12 5v22M21 5v22" stroke="#14171c" stroke-width="2"/></svg>
+      <span>Fachfinder</span>
+    </div>
+    <div class="search">
+      <svg class="search-ico" viewBox="0 0 24 24" width="16" height="16"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="m20 20-4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      <input id="search" type="search" placeholder="Suchen … z. B. „m4 mutter“" autocomplete="off">
+      <div id="results" class="results hidden"></div>
+    </div>
+    <div class="hdr-actions">
+      <button class="btn ghost sm" id="open-tags" title="Labels verwalten">🏷 Labels</button>
+      <a class="btn ghost sm" href="api/export" title="Alle Daten als JSON sichern">Export</a>
+      <button class="btn ghost sm" id="import-btn" title="Export-Datei einlesen (ersetzt alle Daten)">Import</button>
+      <input type="file" id="import-file" accept=".json,application/json" hidden>
+    </div>
+  </header>
+
+  <main>
+    <aside id="tree-pane">
+      <div class="pane-head">
+        <span class="pane-title">Struktur</span>
+        <div class="pane-actions">
+          <button class="btn sm" id="add-area" title="Neuer Bereich auf oberster Ebene">+ Bereich</button>
+          <button class="btn sm primary" id="add-box" title="Neuer Kasten im gewählten Bereich">+ Kasten</button>
+        </div>
+      </div>
+      <div id="tree"></div>
+    </aside>
+
+    <section id="view">
+      <canvas id="c"></canvas>
+      <div id="view-empty" class="view-empty hidden"></div>
+      <div id="view-info" class="view-info"></div>
+      <div class="view-tools">
+        <button class="icon-btn" id="fit" title="Ansicht einpassen">⤢</button>
+        <button class="icon-btn" id="view-front" title="Von vorne">▣</button>
+        <button class="icon-btn" id="view-top" title="Von oben">⊤</button>
+      </div>
+      <div id="tip" class="tip hidden"></div>
+    </section>
+
+    <aside id="panel"></aside>
+  </main>
+
+  <div id="modal" class="modal hidden"></div>
+  <div id="toast" class="toast hidden"></div>
+
+  <script type="module" src="static/app.js"></script>
+</body>
+</html>

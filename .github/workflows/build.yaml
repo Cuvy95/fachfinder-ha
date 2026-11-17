@@ -1,0 +1,63 @@
+# Baut bei jedem Push auf main die App-Images für amd64 und aarch64 und legt sie in
+# der GitHub Container Registry (ghcr.io) ab. Home Assistant lädt sie dann fertig herunter.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "fachfinder/**"
+      - ".github/workflows/build.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version und Image-Name bestimmen
+        id: meta
+        run: |
+          version=$(sed -nE 's/^version:[[:space:]]*"?([^"]+)"?.*/\1/p' fachfinder/config.yaml)
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$owner/${{ matrix.arch }}-fachfinder" >> "$GITHUB_OUTPUT"
+          echo "Baue $owner/${{ matrix.arch }}-fachfinder:$version"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: fachfinder
+          platforms: ${{ matrix.platform }}
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:latest
+          labels: |
+            io.hass.type=addon
+            io.hass.arch=${{ matrix.arch }}
+            io.hass.version=${{ steps.meta.outputs.version }}
+            io.hass.name=Fachfinder
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
