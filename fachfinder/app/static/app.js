@@ -1,10 +1,11 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { openLayoutEditor } from './editor.js?v=1.2.0';
 
 /* =====================================================================
    Helfer
    ===================================================================== */
-const APP_VERSION = '1.1.0'; // muss zu APP_VERSION in main.py passen
+const APP_VERSION = '1.2.0'; // muss zu APP_VERSION in main.py passen
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -20,7 +21,8 @@ const ICON = {
 };
 
 function rowLetter(i) { let s = ''; i++; while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; }
-const cellCode = c => rowLetter(c.row) + (c.col + 1);
+const codeMap = new Map();            // Fachnamen bei exakt angepassten Kästen (fortlaufend je Reihe)
+const cellCode = c => codeMap.get(c.id) ?? rowLetter(c.row) + (c.col + 1);
 const slotCount = c => (c.sub_rows || 1) * (c.sub_cols || 1);
 const slotCode = (c, s) => slotCount(c) > 1 ? `${cellCode(c)}.${(s || 0) + 1}` : cellCode(c);
 const LT = {
@@ -83,6 +85,15 @@ const areaBoxes = aid => D.boxes.filter(b => b.area_id === aid).sort(byName);
 const boxCells = bid => D.cells.filter(c => c.box_id === bid).sort((a, b) => a.row - b.row || a.col - b.col);
 const cellItems = cid => D.items.filter(i => i.cell_id === cid).sort(byName);
 const slotItems = (cid, s) => cellItems(cid).filter(i => (i.slot || 0) === s);
+// Spaltenbreiten/Zeilenhöhen als Anteile (Summe 1); leer = gleichmäßig
+const fracs = (v, n) => Array.isArray(v) && v.length === n && v.every(x => x > 0)
+  ? (sum => v.map(x => x / sum))(v.reduce((a, x) => a + x, 0)) : Array(n).fill(1 / n);
+const edgesOf = f => f.reduce((a, x) => (a.push(a[a.length - 1] + x), a), [0]);
+const boxEdges = b => ({ X: edgesOf(fracs(b.col_w, b.cols)).map(e => e * b.width), Z: edgesOf(fracs(b.row_h, b.rows)).map(e => e * b.depth) });
+const isUniform = b => !(b.col_w || []).length && !(b.row_h || []).length;
+const realCells = bid => boxCells(bid).filter(c => !c.gap);
+const layoutOf = c => ({ id: c.id, row: c.row, col: c.col, rowspan: c.rowspan, colspan: c.colspan, label: c.label, gap: !!c.gap });
+let labelOpen = null;                 // Fach, bei dem das Namensfeld aufgeklappt ist
 
 /* ---------- Labels ---------- */
 const tagKids = pid => D.tags.filter(t => (t.parent_id ?? null) === pid).sort(byName);
@@ -124,6 +135,14 @@ function findItems({ q, tag }) {
   const words = String(q || '').toLowerCase().split(/\s+/).filter(Boolean);
   return words.length ? D.items.filter(i => matchWords(words, itemHay(i))) : [];
 }
+// Fächer, die nur über ihre Beschriftung passen – Fächer mit Teil-Treffer zählen nicht doppelt
+function findLabelCells({ q, tag }, hits) {
+  if (tag != null) return [];
+  const words = String(q || '').toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return [];
+  const have = new Set(hits.map(i => i.cell_id));
+  return D.cells.filter(c => !c.gap && c.label && !have.has(c.id) && matchWords(words, c.label));
+}
 
 function areaPath(aid) {
   const parts = []; let a = M.area.get(aid);
@@ -148,6 +167,12 @@ function indexData() {
   D.items.forEach(i => M.item.set(i.id, i));
   D.tags = D.tags || [];
   D.tags.forEach(t => M.tag.set(t.id, t));
+  codeMap.clear();
+  for (const b of D.boxes) if ((b.col_w || []).length || (b.row_h || []).length) {
+    const bc = D.cells.filter(c => c.box_id === b.id && !c.gap);
+    [...new Set(bc.map(c => c.row))].sort((x, y) => x - y).forEach((r, ri) =>
+      bc.filter(c => c.row === r).sort((x, y) => x.col - y.col).forEach((c, k) => codeMap.set(c.id, rowLetter(ri) + (k + 1))));
+  }
   tagTerms.clear();
   D.tags.forEach(t => tagTerms.set(t.id, tagChain(t.id).map(x => `${x.name} ${x.synonyms}`).join(' ')));
   cnt.cell.clear(); cnt.box.clear(); cnt.area.clear();
@@ -455,6 +480,9 @@ function renderBoxPanel(b) {
   const cur = selCell ? M.cell.get(selCell) : null;
   const multiArr = [...multi];
   const canSplit = multiArr.some(id => { const c = M.cell.get(id); return c && (c.rowspan > 1 || c.colspan > 1); });
+  const gapN = cells.filter(c => c.gap).length;
+  const allGap = multiArr.length > 0 && multiArr.every(id => M.cell.get(id)?.gap);
+  const tidyN = cells.filter(c => needsTidy(c)).length;
 
   panel.innerHTML = `
     <div class="p-head"><div class="kicker">Kasten</div><h2>${esc(b.name)}</h2><div class="path">${esc(areaPath(b.area_id))}</div></div>
@@ -462,15 +490,16 @@ function renderBoxPanel(b) {
     <div class="sec" id="cell-sec">${cur ? cellSection(cur) : `<div class="sec-title">Fach</div><div class="no-items">Klick auf ein Fach in der 3D-Ansicht oder im Raster unten.</div>`}</div>
 
     <div class="sec">
-      <div class="sec-title">Fächer <span style="text-transform:none;letter-spacing:0">${cells.length} Fächer</span></div>
+      <div class="sec-title">Fächer <span style="text-transform:none;letter-spacing:0">${cells.filter(c => !c.gap).length} Fächer${gapN ? ` · ${gapN} ${gapN === 1 ? 'Aussparung' : 'Aussparungen'}` : ''}</span></div>
       <div class="row2" style="margin-bottom:10px">
-        <label class="field" style="margin:0"><span>Zeilen</span><div class="stepper"><button data-step="rows:-1">−</button><input id="b-rows" type="number" value="${b.rows}" min="1" max="40"><button data-step="rows:1">+</button></div></label>
-        <label class="field" style="margin:0"><span>Spalten</span><div class="stepper"><button data-step="cols:-1">−</button><input id="b-cols" type="number" value="${b.cols}" min="1" max="40"><button data-step="cols:1">+</button></div></label>
+        <label class="field" style="margin:0"><span>Zeilen</span><div class="stepper"><button data-step="rows:-1">−</button><input id="b-rows" type="number" value="${b.rows}" min="1" max="60"><button data-step="rows:1">+</button></div></label>
+        <label class="field" style="margin:0"><span>Spalten</span><div class="stepper"><button data-step="cols:-1">−</button><input id="b-cols" type="number" value="${b.cols}" min="1" max="60"><button data-step="cols:1">+</button></div></label>
       </div>
-      <div class="grid-ed" id="grid-ed" style="--boxc:${esc(b.color)};aspect-ratio:${ar};grid-template-columns:repeat(${b.cols},minmax(0,1fr));grid-template-rows:repeat(${b.rows},minmax(0,1fr))">
+      <div class="grid-ed" id="grid-ed" style="--boxc:${esc(b.color)};aspect-ratio:${ar};grid-template-columns:${fracs(b.col_w, b.cols).map(f => `minmax(0,${(f * 100).toFixed(3)}fr)`).join(' ')};grid-template-rows:${fracs(b.row_h, b.rows).map(f => `minmax(0,${(f * 100).toFixed(3)}fr)`).join(' ')}">
         ${cells.map(c => {
+          if (c.gap) return `<div class="gc gap ${c.id === selCell ? 'sel' : multi.has(c.id) ? 'multi' : ''}" data-cell="${c.id}" title="${esc(cellCode(c))} – Aussparung (kein Fach)" style="grid-row:${c.row + 1} / span ${c.rowspan};grid-column:${c.col + 1} / span ${c.colspan}"></div>`;
           const n = cnt.cell.get(c.id) || 0;
-          const label = c.label || (n ? cellItems(c.id)[0].name : '');
+          const label = c.label || (n ? cellItems(c.id)[0].name + (n > 1 ? ` +${n - 1}` : '') : '');
           const cls = ['gc', (n || c.label) ? 'filled' : '', c.id === selCell ? 'sel' : multi.has(c.id) ? 'multi' : ''].join(' ');
           return `<div class="${cls}" data-cell="${c.id}" title="${esc(cellCode(c) + (label ? ' – ' + label : ''))}" style="grid-row:${c.row + 1} / span ${c.rowspan};grid-column:${c.col + 1} / span ${c.colspan}">
             <span>${cellCode(c)}${slotCount(c) > 1 ? ` <i class="subind">÷${slotCount(c)}</i>` : ''}</span>${label ? `<span class="gl">${esc(label)}</span>` : ''}</div>`;
@@ -479,8 +508,12 @@ function renderBoxPanel(b) {
       <div class="btn-row" style="margin-top:10px">
         <button class="btn sm" id="merge" ${multi.size < 2 ? 'disabled' : ''}>⊞ Verbinden${multi.size > 1 ? ` (${multi.size})` : ''}</button>
         <button class="btn sm" id="split" ${canSplit ? '' : 'disabled'}>⊟ Teilen</button>
+        <button class="btn sm primary" id="exact" title="Wände frei in mm verschieben, z. B. für unterschiedlich große Fächer">📐 Exakt anpassen</button>
+        <button class="btn sm" id="gap" ${multi.size ? '' : 'disabled'} title="Aussparung = kein Fach, z. B. für Griff oder Ecke">${allGap ? '▣ Wieder Fach' : '▢ Aussparung'}</button>
       </div>
-      <div class="hint"><b>Shift</b>- oder <b>Strg</b>-Klick wählt mehrere Fächer. Beim Verbinden oder Verkleinern landet der Inhalt im übrigbleibenden Fach, es geht also nichts verloren.</div>
+      <div class="hint">Alle Fächer gleich groß? Dann reichen Zeilen und Spalten. <b>Shift</b>-Klick wählt mehrere Fächer zum <b>Verbinden</b>.<br>
+        Fächer unterschiedlich groß oder Griffmulde? Mit <b>📐 Exakt anpassen</b> ziehst du die Wände einfach dorthin, wo sie im echten Kasten sitzen.${isUniform(b) ? '' : ' <i>(Dieser Kasten ist exakt angepasst.)</i>'}</div>
+      ${tidyN ? `<div class="tidy"><span>${tidyN} ${tidyN === 1 ? 'Fach hat' : 'Fächer haben'} eine Beschriftung, die eigentlich der Inhalt ist.</span><button class="btn sm" id="tidy-box">Aufräumen</button></div>` : ''}
     </div>
 
     <div class="sec">
@@ -493,6 +526,9 @@ function renderBoxPanel(b) {
           <option value="stehend"${st ? ' selected' : ''}>Stehend (Regal)</option></select></label>
         <label class="field"><span>Farbe</span><input id="b-color" type="color" value="${esc(b.color)}"></label>
       </div>
+      <label class="field"><span>Beschriftungsschild am Fach</span><select id="b-lpos">
+        <option value="unten"${b.label_pos !== 'oben' ? ' selected' : ''}>Unten (${st ? 'Unterkante' : 'vorne'})</option>
+        <option value="oben"${b.label_pos === 'oben' ? ' selected' : ''}>Oben (${st ? 'Oberkante' : 'hinten'})</option></select></label>
       <div class="row3">
         <label class="field"><span>Breite mm</span><input id="b-w" type="number" min="1" value="${b.width}"></label>
         <label class="field"><span>${st ? 'Höhe' : 'Tiefe'} mm</span><input id="b-d" type="number" min="1" value="${b.depth}"></label>
@@ -517,6 +553,18 @@ function renderBoxPanel(b) {
   $('#b-cols').onchange = e => resizeGrid(b, b.rows, +e.target.value);
   $('#merge').onclick = () => mergeCells(b);
   $('#split').onclick = () => splitCells(b);
+  $('#gap').onclick = () => toggleGap(b, !allGap);
+  $('#exact').onclick = () => openLayoutEditor({
+    box: b, cells: boxCells(b.id), edges: boxEdges(b), rowLetter, toast,
+    itemCount: id => cnt.cell.get(id) || 0,
+    cellName: c => { const its = cellItems(c.id); return its.length ? its[0].name + (its.length > 1 ? ` +${its.length - 1}` : '') : ''; },
+    onSave: async layout => { await saveLayout(b, layout); toast('Fachaufteilung gespeichert.'); },
+  });
+  $('#tidy-box')?.addEventListener('click', async () => {
+    const r = await api('POST', `api/boxes/${b.id}/tidy`);
+    await reload();
+    toast(`${r.converted} Beschriftungen als Inhalt eingetragen, ${r.cleared} doppelte entfernt.`);
+  });
 
   // Eigenschaften
   const patch = async data => { await api('PATCH', `api/boxes/${b.id}`, data); await reload(); };
@@ -524,6 +572,7 @@ function renderBoxPanel(b) {
   $('#b-area').onchange = e => patch({ area_id: +e.target.value });
   $('#b-ori').onchange = e => patch({ orientation: e.target.value });
   $('#b-color').onchange = e => patch({ color: e.target.value });
+  $('#b-lpos').onchange = e => patch({ label_pos: e.target.value });
   $('#b-w').onchange = e => +e.target.value > 0 && patch({ width: +e.target.value });
   $('#b-d').onchange = e => +e.target.value > 0 && patch({ depth: +e.target.value });
   $('#b-h').onchange = e => +e.target.value > 0 && patch({ height: +e.target.value });
@@ -536,15 +585,34 @@ function renderBoxPanel(b) {
   };
 }
 
+function needsTidy(c) {
+  if (c.gap || !c.label) return false;
+  const its = cellItems(c.id);
+  return !its.length || (its.length === 1 && its[0].name.trim().toLowerCase() === c.label.trim().toLowerCase());
+}
+
+function gapSection(c) {
+  return `<div class="sec-title">Aussparung <span class="code">${cellCode(c)}</span></div>
+    <div class="no-items">Hier ist kein Fach, z. B. Griffmulde oder abgeschrägte Ecke. Wird in 3D und in der Suche ausgelassen.</div>
+    <button class="btn sm" id="ungap">▣ Wieder als Fach nutzen</button>`;
+}
+
 function cellSection(c) {
+  if (c.gap) return gapSection(c);
   const n = slotCount(c), st = M.box.get(c.box_id).orientation === 'stehend';
-  const sz = c.rowspan > 1 || c.colspan > 1 ? ` · ${c.rowspan}×${c.colspan}` : '';
   const items = slotItems(c.id, selSlot);
   const b = M.box.get(c.box_id);
-  const ar = clamp((c.colspan * b.width / b.cols) / (c.rowspan * b.depth / b.rows), 0.4, 3);
+  const { X, Z } = boxEdges(b);
+  const mm = v => Math.round(v * 10) / 10;
+  const sz = !isUniform(b) ? ` · ${mm(X[c.col + c.colspan] - X[c.col])}×${mm(Z[c.row + c.rowspan] - Z[c.row])} mm`
+    : c.rowspan > 1 || c.colspan > 1 ? ` · ${c.rowspan}×${c.colspan}` : '';
+  const ar = clamp((X[c.col + c.colspan] - X[c.col]) / (Z[c.row + c.rowspan] - Z[c.row]), 0.4, 3);
   return `
     <div class="sec-title">Fach <span class="code">${slotCode(c, selSlot)}${sz}</span></div>
-    <label class="field"><span>Beschriftung des Fachs (optional)</span><input id="c-label" value="${esc(c.label)}" placeholder="z. B. DC/DC-Wandler"></label>
+    ${c.label || labelOpen === c.id ? `
+    <label class="field"><span>Fachname – nur für Sammelfächer mit mehreren Teilen</span><input id="c-label" value="${esc(c.label)}" placeholder="z. B. DC/DC-Wandler"></label>
+    ${needsTidy(c) ? `<div class="tidy"><span>${cellItems(c.id).length ? 'Der Name ist derselbe wie der Inhalt.' : 'Liegt hier nur „' + esc(c.label) + '“ drin?'}</span>
+      <button class="btn sm" id="c-tidy">${cellItems(c.id).length ? 'Doppelten Namen entfernen' : 'Als Inhalt eintragen'}</button></div>` : ''}` : ''}
 
     <div class="sub-box">
       <div class="sub-head"><span>Trenner</span>
@@ -572,7 +640,8 @@ function cellSection(c) {
       <input id="new-name" placeholder="Was liegt drin? z. B. DC/DC-Wandler" autocomplete="off">
       <input id="new-qty" placeholder="Menge" autocomplete="off">
       <button class="btn primary" type="submit">+</button>
-    </form>`;
+    </form>
+    ${!c.label && labelOpen !== c.id ? `<button class="linkbtn" id="c-label-open">+ Fachname vergeben (für Sammelfächer)</button>` : ''}`;
 }
 
 function itemCard(i) {
@@ -627,7 +696,11 @@ function itemCard(i) {
 }
 
 function bindCellSection(c) {
-  $('#c-label').onchange = async e => { await api('PATCH', `api/cells/${c.id}`, { label: e.target.value }); await reload(); };
+  if (c.gap) { $('#ungap').onclick = () => toggleGap(M.box.get(c.box_id), false, [c.id]); return; }
+  const lbl = $('#c-label');
+  if (lbl) lbl.onchange = async e => { await api('PATCH', `api/cells/${c.id}`, { label: e.target.value }); if (!e.target.value.trim()) labelOpen = null; await reload(); };
+  $('#c-label-open')?.addEventListener('click', () => { labelOpen = c.id; renderPanel(); $('#c-label')?.focus(); });
+  $('#c-tidy')?.addEventListener('click', async () => { await api('POST', `api/cells/${c.id}/tidy`); labelOpen = null; await reload(); });
   panel.querySelectorAll('[data-sub]').forEach(el => el.onclick = async () => {
     const [k, d] = el.dataset.sub.split(':');
     const sub_rows = clamp(c.sub_rows + (k === 'r' ? +d : 0), 1, 12), sub_cols = clamp(c.sub_cols + (k === 'c' ? +d : 0), 1, 12);
@@ -742,7 +815,9 @@ function searchTitle() {
 }
 
 function renderSearchPanel() {
-  const hits = findItems(sel);
+  const items = findItems(sel);
+  // Fächer, die nur über ihre Beschriftung passen, erscheinen als eigener Eintrag
+  const hits = [...items, ...findLabelCells(sel, items).map(c => ({ cell_id: c.id, slot: 0, name: c.label, qty: '', tags: [], cellOnly: true }))];
   const byBox = new Map();
   for (const i of hits) {
     const c = M.cell.get(i.cell_id);
@@ -755,7 +830,7 @@ function renderSearchPanel() {
   panel.innerHTML = `
     <div class="p-head"><div class="kicker">${t ? 'Label' : 'Suche'}</div>
       <h2>${t ? `<span class="dot" style="background:${esc(t.color)}"></span>` : ''}${esc(searchTitle())}</h2>
-      <div class="path">${t && t.parent_id ? `<a href="#" data-up="${t.parent_id}">${esc(tagPath(t.parent_id))}</a> › ` : ''}${hits.length} ${hits.length === 1 ? 'Teil' : 'Teile'} in ${boxes.length} ${boxes.length === 1 ? 'Kasten' : 'Kästen'}</div>
+      <div class="path">${t && t.parent_id ? `<a href="#" data-up="${t.parent_id}">${esc(tagPath(t.parent_id))}</a> › ` : ''}${hits.length} Treffer in ${boxes.length} ${boxes.length === 1 ? 'Kasten' : 'Kästen'}</div>
       ${t?.synonyms ? `<div class="path" style="margin-top:4px">Auch gefunden über: ${esc(t.synonyms)}</div>` : ''}
     </div>
     ${kids.length ? `<div class="sec"><div class="sec-title">Genauer</div><div class="tags">${kids.map(k => tagChip(k.id)).join('')}</div></div>` : ''}
@@ -764,7 +839,7 @@ function renderSearchPanel() {
         <div class="sec-title"><span style="text-transform:none;letter-spacing:0;color:var(--fg);font-size:13px">${esc(b.name)}</span><span style="text-transform:none;letter-spacing:0">${esc(areaPath(b.area_id))}</span></div>
         <div class="hits">${byBox.get(b.id).sort((x, y) => x.cell_id - y.cell_id || x.slot - y.slot).map(i => {
           const c = M.cell.get(i.cell_id);
-          return `<div class="hit" data-hit="${i.id}"><span class="code">${slotCode(c, i.slot || 0)}</span>
+          return `<div class="hit" data-hit="${i.id ?? ''}" data-hcell="${i.cell_id}"><span class="code">${slotCode(c, i.slot || 0)}</span>
             <span class="hn">${esc(i.name)}${i.qty ? ` <i>· ${esc(i.qty)}</i>` : ''}</span>
             <span class="tags">${(i.tags || []).map(x => tagChip(x)).join('')}</span></div>`;
         }).join('')}</div>
@@ -772,7 +847,8 @@ function renderSearchPanel() {
     <div class="sec"><button class="btn sm" id="close-search">Suche schließen</button></div>`;
   panel.querySelectorAll('[data-hit]').forEach(el => el.onclick = e => {
     if (e.target.closest('.tg')) return;
-    const i = M.item.get(+el.dataset.hit); goCell(i.cell_id, i.slot || 0);
+    const i = el.dataset.hit ? M.item.get(+el.dataset.hit) : null;
+    goCell(i ? i.cell_id : +el.dataset.hcell, i ? i.slot || 0 : 0);
   });
   panel.querySelectorAll('[data-up]').forEach(el => el.onclick = e => { e.preventDefault(); showSearch({ tag: +el.dataset.up }); });
   bindTagChips(panel);
@@ -828,7 +904,7 @@ function renderTagManager() {
 async function moveItem(id) {
   const it = M.item.get(id);
   const opts = [];
-  for (const c of D.cells) for (let s = 0; s < slotCount(c); s++)
+  for (const c of D.cells) if (!c.gap) for (let s = 0; s < slotCount(c); s++)
     opts.push({ value: `${c.id}:${s}`, label: cellPath(c, s) + (c.label ? ` – ${c.label}` : '') });
   opts.sort((a, b) => a.label.localeCompare(b.label, 'de', { numeric: true }));
   const r = await dialog({ title: `„${it.name}“ verschieben`, fields: [{ name: 'to', label: 'Ziel-Fach', type: 'select', value: `${it.cell_id}:${it.slot || 0}`, options: opts }], ok: 'Verschieben' });
@@ -842,25 +918,28 @@ async function moveItem(id) {
 
 /* ---------- Raster-Operationen ---------- */
 async function saveLayout(b, layout) {
+  layout = { col_w: fracs(b.col_w, b.cols), row_h: fracs(b.row_h, b.rows), ...layout };
   await api('PUT', `api/boxes/${b.id}/layout`, layout);
   await reload();
 }
 
 function resizeGrid(b, rows, cols) {
-  rows = clamp(rows | 0, 1, 40); cols = clamp(cols | 0, 1, 40);
+  rows = clamp(rows | 0, 1, 60); cols = clamp(cols | 0, 1, 60);
   if (rows === b.rows && cols === b.cols) return renderPanel();
   const taken = Array.from({ length: rows }, () => Array(cols).fill(false));
   const cells = [];
   for (const c of boxCells(b.id)) {
     if (c.row >= rows || c.col >= cols) continue;
     const rs = Math.min(c.rowspan, rows - c.row), cs = Math.min(c.colspan, cols - c.col);
-    cells.push({ id: c.id, row: c.row, col: c.col, rowspan: rs, colspan: cs, label: c.label });
+    cells.push({ ...layoutOf(c), rowspan: rs, colspan: cs });
     for (let r = c.row; r < c.row + rs; r++) for (let k = c.col; k < c.col + cs; k++) taken[r][k] = true;
   }
   for (let r = 0; r < rows; r++) for (let k = 0; k < cols; k++) if (!taken[r][k]) cells.push({ row: r, col: k, rowspan: 1, colspan: 1, label: '' });
-  const lost = boxCells(b.id).filter(c => (c.row >= rows || c.col >= cols) && (cnt.cell.get(c.id) || c.label));
+  const lost = boxCells(b.id).filter(c => (c.row >= rows || c.col >= cols) && !c.gap && (cnt.cell.get(c.id) || c.label));
   if (lost.length) toast(`Inhalt aus ${lost.length} weggefallenen Fächern wurde ins Randfach verschoben.`);
-  saveLayout(b, { rows, cols, cells });
+  // Bei angepassten Breiten: neue Spalten/Zeilen bekommen die Durchschnittsgröße
+  const fit = (f, n) => { const m = f.reduce((a, x) => a + x, 0) / f.length; return f.length >= n ? f.slice(0, n) : [...f, ...Array(n - f.length).fill(m)]; };
+  saveLayout(b, { rows, cols, cells, col_w: fit(fracs(b.col_w, b.cols), cols), row_h: fit(fracs(b.row_h, b.rows), rows) });
 }
 
 function mergeCells(b) {
@@ -871,9 +950,9 @@ function mergeCells(b) {
   const area = sc.reduce((s, c) => s + c.rowspan * c.colspan, 0);
   if (area !== (r1 - r0) * (c1 - c0)) return toast('Die Auswahl muss ein lückenloses Rechteck ergeben.', true);
   sc.sort((a, b) => a.row - b.row || a.col - b.col);
-  const keep = sc[0];
-  const cells = boxCells(b.id).filter(c => !multi.has(c.id)).map(({ id, row, col, rowspan, colspan, label }) => ({ id, row, col, rowspan, colspan, label }));
-  cells.push({ id: keep.id, row: r0, col: c0, rowspan: r1 - r0, colspan: c1 - c0, label: sc.find(c => c.label)?.label || '' });
+  const keep = sc.find(c => !c.gap) || sc[0];
+  const cells = boxCells(b.id).filter(c => !multi.has(c.id)).map(layoutOf);
+  cells.push({ id: keep.id, row: r0, col: c0, rowspan: r1 - r0, colspan: c1 - c0, label: sc.find(c => c.label)?.label || '', gap: sc.every(c => c.gap) });
   selCell = keep.id; multi = new Set([keep.id]);
   saveLayout(b, { rows: b.rows, cols: b.cols, cells });
 }
@@ -884,10 +963,22 @@ function splitCells(b) {
     if (multi.has(c.id) && (c.rowspan > 1 || c.colspan > 1)) {
       for (let r = c.row; r < c.row + c.rowspan; r++) for (let k = c.col; k < c.col + c.colspan; k++) {
         const first = r === c.row && k === c.col;
-        cells.push({ id: first ? c.id : undefined, row: r, col: k, rowspan: 1, colspan: 1, label: first ? c.label : '' });
+        cells.push({ id: first ? c.id : undefined, row: r, col: k, rowspan: 1, colspan: 1, label: first ? c.label : '', gap: !!c.gap });
       }
-    } else cells.push({ id: c.id, row: c.row, col: c.col, rowspan: c.rowspan, colspan: c.colspan, label: c.label });
+    } else cells.push(layoutOf(c));
   }
+  saveLayout(b, { rows: b.rows, cols: b.cols, cells });
+}
+
+function toggleGap(b, makeGap, ids = [...multi]) {
+  const pick = new Set(ids.filter(id => M.cell.get(id)?.box_id === b.id));
+  if (!pick.size) return;
+  if (makeGap) {
+    const full = [...pick].map(id => M.cell.get(id)).filter(c => !c.gap && cnt.cell.get(c.id));
+    if (full.length) return toast(`${full.map(cellCode).join(', ')} ${full.length === 1 ? 'ist' : 'sind'} nicht leer. Inhalt erst verschieben oder löschen.`, true);
+    if (pick.size === boxCells(b.id).filter(c => !c.gap).length) return toast('Mindestens ein Fach muss bleiben.', true);
+  }
+  const cells = boxCells(b.id).map(c => pick.has(c.id) ? { ...layoutOf(c), gap: makeGap, label: makeGap ? '' : c.label } : layoutOf(c));
   saveLayout(b, { rows: b.rows, cols: b.cols, cells });
 }
 
@@ -1023,43 +1114,62 @@ function buildBox(b, showTitle) {
   const wrap = new THREE.Group();
   const inner = new THREE.Group(); wrap.add(inner);
   const W = +b.width || 300, Dp = +b.depth || 200, H = +b.height || 50;
-  const rows = b.rows, cols = b.cols, cw = W / cols, ch = Dp / rows, x0 = -W / 2, z0 = -Dp / 2;
-  const t = clamp(Math.min(cw, ch) * 0.05, 0.8, 4);
+  const rows = b.rows, cols = b.cols, x0 = -W / 2, z0 = -Dp / 2;
+  const { X, Z } = boxEdges(b);
+  const minStep = Math.min(...X.slice(1).map((x, i) => x - X[i]), ...Z.slice(1).map((z, i) => z - Z[i]));
+  const t = clamp(minStep * 0.05, 0.8, 4);
   const to = t * 1.8, baseH = Math.max(2, to);
   const col = new THREE.Color(b.color || '#4f7cac');
   const matShell = new THREE.MeshStandardMaterial({ color: col, roughness: 0.5, metalness: 0.05 });
   const matWall = new THREE.MeshStandardMaterial({ color: col.clone().lerp(WHITE, 0.3), roughness: 0.4, transparent: true, opacity: 0.5, depthWrite: false });
   const matEmpty = new THREE.Color(0x353b45), matFull = col.clone().lerp(WHITE, 0.66);
 
-  const base = mesh(new THREE.BoxGeometry(W + to, baseH, Dp + to), matShell);
-  base.position.y = -baseH / 2; inner.add(base);
+  const cells = realCells(b.id);
+  const hasGap = cells.length !== boxCells(b.id).length;
 
-  // Trennwände aus den Fachgrenzen ableiten
-  const hl = new Map(), vl = new Map();
+  // Boden: am Stück, bei Aussparungen nur unter den echten Fächern
+  if (!hasGap) {
+    const base = mesh(new THREE.BoxGeometry(W + to, baseH, Dp + to), matShell);
+    base.position.y = -baseH / 2; inner.add(base);
+  } else for (const c of cells) {
+    const base = mesh(new THREE.BoxGeometry(X[c.col + c.colspan] - X[c.col] + to, baseH, Z[c.row + c.rowspan] - Z[c.row] + to), matShell);
+    base.position.set(x0 + (X[c.col] + X[c.col + c.colspan]) / 2, -baseH / 2, z0 + (Z[c.row] + Z[c.row + c.rowspan]) / 2); inner.add(base);
+  }
+
+  // Trennwände aus den Fachgrenzen ableiten; Außenwand = Rand oder Grenze zu einer Aussparung
+  const occ = Array.from({ length: rows }, () => Array(cols).fill(null));
+  for (const c of cells) for (let r = c.row; r < c.row + c.rowspan; r++) for (let k = c.col; k < c.col + c.colspan; k++) if (occ[r]) occ[r][k] = c.id;
+  const at = (r, k) => (r < 0 || k < 0 || r >= rows || k >= cols) ? null : occ[r][k];
+  const lines = { h: [new Map(), new Map()], v: [new Map(), new Map()] };  // [innen, außen]
   const add = (m, i, k) => { if (!m.has(i)) m.set(i, new Set()); m.get(i).add(k); };
-  const cells = boxCells(b.id);
-  for (const c of cells) {
-    for (let k = c.col; k < c.col + c.colspan; k++) { add(hl, c.row, k); add(hl, c.row + c.rowspan, k); }
-    for (let r = c.row; r < c.row + c.rowspan; r++) { add(vl, c.col, r); add(vl, c.col + c.colspan, r); }
+  for (let i = 0; i <= rows; i++) for (let k = 0; k < cols; k++) {
+    const a = at(i - 1, k), e = at(i, k);
+    if (a === e) continue;
+    add(lines.h[a == null || e == null ? 1 : 0], i, k);
   }
-  for (const [i, ks] of hl) for (const [a, e] of runs(ks)) {
-    const outer = i === 0 || i === rows, th = outer ? to : t, hh = outer ? H : H * 0.88;
-    const m = mesh(new THREE.BoxGeometry((e - a) * cw + th, hh, th), outer ? matShell : matWall);
-    m.position.set(x0 + (a + e) / 2 * cw, hh / 2, z0 + i * ch); inner.add(m);
+  for (let i = 0; i <= cols; i++) for (let r = 0; r < rows; r++) {
+    const a = at(r, i - 1), e = at(r, i);
+    if (a === e) continue;
+    add(lines.v[a == null || e == null ? 1 : 0], i, r);
   }
-  for (const [i, rs] of vl) for (const [a, e] of runs(rs)) {
-    const outer = i === 0 || i === cols, th = outer ? to : t, hh = outer ? H : H * 0.88;
-    const m = mesh(new THREE.BoxGeometry(th, hh, (e - a) * ch + th), outer ? matShell : matWall);
-    m.position.set(x0 + i * cw, hh / 2, z0 + (a + e) / 2 * ch); inner.add(m);
-  }
+  lines.h.forEach((map, outer) => { for (const [i, ks] of map) for (const [a, e] of runs(ks)) {
+    const th = outer ? to : t, hh = outer ? H : H * 0.88;
+    const m = mesh(new THREE.BoxGeometry(X[e] - X[a] + th, hh, th), outer ? matShell : matWall);
+    m.position.set(x0 + (X[a] + X[e]) / 2, hh / 2, z0 + Z[i]); inner.add(m);
+  } });
+  lines.v.forEach((map, outer) => { for (const [i, rs] of map) for (const [a, e] of runs(rs)) {
+    const th = outer ? to : t, hh = outer ? H : H * 0.88;
+    const m = mesh(new THREE.BoxGeometry(th, hh, Z[e] - Z[a] + th), outer ? matShell : matWall);
+    m.position.set(x0 + X[i], hh / 2, z0 + (Z[a] + Z[e]) / 2); inner.add(m);
+  } });
 
   // Fachböden, Trenner + Beschriftung
   const matDiv = new THREE.MeshStandardMaterial({ color: col.clone().lerp(WHITE, 0.75), roughness: 0.3, transparent: true, opacity: 0.55, depthWrite: false });
   const td = Math.max(0.6, t * 0.6), dh = H * 0.72;
   const matPlate = new THREE.MeshStandardMaterial({ color: 0xb9c0cc, roughness: 0.6 });
   for (const c of cells) {
-    const w = c.colspan * cw - t, d = c.rowspan * ch - t;
-    const cx = x0 + (c.col + c.colspan / 2) * cw, cz = z0 + (c.row + c.rowspan / 2) * ch;
+    const w = X[c.col + c.colspan] - X[c.col] - t, d = Z[c.row + c.rowspan] - Z[c.row] - t;
+    const cx = x0 + (X[c.col] + X[c.col + c.colspan]) / 2, cz = z0 + (Z[c.row] + Z[c.row + c.rowspan]) / 2;
     const sr = c.sub_rows || 1, sc = c.sub_cols || 1, n = sr * sc;
     const sw = w / sc, sd = d / sr;
     // Trenner
@@ -1101,7 +1211,8 @@ function buildBox(b, showTitle) {
       const sh = clamp(Math.min(d * 0.26, w * 0.32), 5, 24);
       const sw2 = w - t * 0.5;
       const plate = new THREE.Mesh(new THREE.BoxGeometry(sw2, 0.8, sh), matPlate);
-      plate.position.set(cx, H + 0.4, cz + d / 2 - sh / 2 + t / 2);
+      const top = b.label_pos === 'oben';  // Schild hinten/oben oder vorne/unten am Fach – wie in der 2D-Ansicht
+      plate.position.set(cx, H + 0.4, top ? cz - d / 2 + sh / 2 - t / 2 : cz + d / 2 - sh / 2 + t / 2);
       plate.castShadow = true;
       plate.userData = { cellId: c.id, slot: 0, boxId: b.id };
       pickables.push(plate);
@@ -1147,11 +1258,15 @@ function render3D() {
   else if (sel.type === 'area' && M.area.has(sel.id)) boxes = areaBoxes(sel.id);
   else if (sel.type === 'search') {
     hits = findItems(sel);
+    const lc = findLabelCells(sel, hits);
     hits.forEach(i => searchHits.add(`${i.cell_id}:${i.slot || 0}`));
-    const ids = [...new Set(hits.map(i => M.cell.get(i.cell_id).box_id))];
+    lc.forEach(c => { for (let s = 0; s < slotCount(c); s++) searchHits.add(`${c.id}:${s}`); });
+    hits = [...hits, ...lc];
+    const ids = [...new Set([...hits.map(i => M.cell.get(i.cell_id ?? i.id).box_id)])];
     boxes = ids.map(id => M.box.get(id)).sort((a, b) => (areaPath(a.area_id) + a.name).localeCompare(areaPath(b.area_id) + b.name, 'de', { numeric: true }));
   }
 
+  view2d.innerHTML = ''; boxes2d = [];
   if (!boxes.length) {
     empty.classList.remove('hidden'); info.classList.add('hidden');
     empty.innerHTML = sel.type === 'search' ? `<div><b>Keine Treffer für ${esc(searchTitle())}</b></div>` : sel.type === 'area'
@@ -1160,6 +1275,8 @@ function render3D() {
     sceneKey = ''; return;
   }
   empty.classList.add('hidden'); info.classList.remove('hidden');
+  setViewInfo(boxes, hits);
+  if (mode2d) { sceneKey = ''; render2D(boxes); return; }
 
   const groups = boxes.map(b => buildBox(b, boxes.length > 1 || sel.type === 'search'));
   const maxW = Math.max(...groups.map(g => g.userData.footW));
@@ -1188,16 +1305,126 @@ function render3D() {
   const key = sel.type + '|' + boxes.map(b => `${b.id}:${b.width}:${b.depth}:${b.height}:${b.orientation}`).join('|');
   if (key !== sceneKey) { fitCamera(); sceneKey = key; }
 
-  // Info
+  updateHighlights();
+}
+
+function setViewInfo(boxes, hits) {
+  const info = $('#view-info');
   if (sel.type === 'search') {
-    info.innerHTML = `<b>${esc(searchTitle())}</b> · ${hits.length} ${hits.length === 1 ? 'Teil' : 'Teile'} in ${boxes.length} ${boxes.length === 1 ? 'Kasten' : 'Kästen'} · Fach anklicken zum Öffnen`;
+    info.innerHTML = `<b>${esc(searchTitle())}</b> · ${hits.length} Treffer in ${boxes.length} ${boxes.length === 1 ? 'Kasten' : 'Kästen'} · Fach anklicken zum Öffnen`;
   } else if (boxes.length === 1) {
     const b = boxes[0];
-    info.innerHTML = `<b>${esc(b.name)}</b> · ${boxCells(b.id).length} Fächer · ${cnt.box.get(b.id) || 0} Teile · ${b.width}×${b.depth}×${b.height} mm`;
+    info.innerHTML = `<b>${esc(b.name)}</b> · ${realCells(b.id).length} Fächer · ${cnt.box.get(b.id) || 0} Teile · ${b.width}×${b.depth}×${b.height} mm`;
   } else {
     info.innerHTML = `<b>${esc(M.area.get(sel.id).name)}</b> · ${boxes.length} Kästen · Fach anklicken zum Öffnen`;
   }
+}
+
+/* =====================================================================
+   2D-Draufsicht (Alternative zur 3D-Ansicht)
+   ===================================================================== */
+let mode2d = !!store.get('mode2d', false);
+let boxes2d = [];
+const view2d = $('#view2d');
+
+function render2D(boxes) {
+  boxes2d = boxes;
+  const multiBox = boxes.length > 1 || sel.type === 'search';
+  view2d.innerHTML = boxes.map(b => {
+    const cw = fracs(b.col_w, b.cols), rh = fracs(b.row_h, b.rows);
+    const cells = boxCells(b.id).map(c => {
+      const pos = `grid-row:${c.row + 1} / span ${c.rowspan};grid-column:${c.col + 1} / span ${c.colspan}`;
+      if (c.gap) return `<div class="c2 gap" style="${pos}"></div>`;
+      const n = slotCount(c);
+      const slots = Array.from({ length: n }, (_, s) => {
+        const its = slotItems(c.id, s);
+        const title = its.length ? its[0].name + (its.length > 1 ? ` +${its.length - 1}` : '') : (n === 1 && c.label ? c.label : '');
+        return `<div class="s2${its.length || (n === 1 && c.label) ? ' full' : ''}" data-k="${c.id}:${s}" data-c="${c.id}" data-s="${s}" data-b="${b.id}">
+          <span class="s2-code">${slotCode(c, s)}</span>${title ? `<span class="s2-t">${esc(title)}</span>` : ''}${its.length && its[0].qty ? `<span class="s2-q">${esc(its[0].qty)}</span>` : ''}</div>`;
+      }).join('');
+      const label = c.label && (n > 1 || cellItems(c.id).length) ? `<div class="c2-lbl">${esc(c.label)}</div>` : '';
+      return `<div class="c2${b.label_pos === 'oben' ? ' lbl-top' : ''}" style="${pos}">${label}<div class="c2-in" style="grid-template-columns:repeat(${c.sub_cols || 1},1fr);grid-template-rows:repeat(${c.sub_rows || 1},1fr)">${slots}</div></div>`;
+    }).join('');
+    return `<div class="b2" data-box2="${b.id}">${multiBox ? `<div class="b2-title"><span class="swatch" style="background:${esc(b.color)}"></span>${esc(b.name)}</div>` : ''}
+      <div class="b2-grid" style="--boxc:${esc(b.color)};grid-template-columns:${cw.map(f => `${(f * 100).toFixed(3)}fr`).join(' ')};grid-template-rows:${rh.map(f => `${(f * 100).toFixed(3)}fr`).join(' ')}">${cells}</div></div>`;
+  }).join('');
+  layout2D();
   updateHighlights();
+}
+
+// Alle Kästen im gleichen Maßstab, so groß wie möglich (Zeilenumbruch bei mehreren Kästen)
+function layout2D() {
+  if (!mode2d || !boxes2d.length) return;
+  const cs = getComputedStyle(view2d);
+  const W = view2d.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - 2;
+  const H = view2d.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom) - 2;
+  if (W <= 0 || H <= 0) return;
+  const multiBox = boxes2d.length > 1 || sel.type === 'search';
+  const titleH = multiBox ? 26 : 0, gap = 24;
+  const fits = k => {
+    let x = 0, y = 0, rowH = 0;
+    for (const b of boxes2d) {
+      const w = b.width * k, h = b.depth * k + titleH;
+      if (w > W) return false;
+      if (x && x + w > W) { y += rowH + gap; x = 0; rowH = 0; }
+      x += w + gap; rowH = Math.max(rowH, h);
+    }
+    return y + rowH <= H;
+  };
+  let k = Math.min(...boxes2d.map(b => Math.min(W / b.width, (H - titleH) / b.depth)));
+  while (k > 0.02 && !fits(k)) k *= 0.95;
+  view2d.querySelectorAll('[data-box2]').forEach(el => {
+    const b = M.box.get(+el.dataset.box2);
+    const g = el.querySelector('.b2-grid');
+    g.style.width = b.width * k + 'px'; g.style.height = b.depth * k + 'px';
+  });
+}
+
+function update2D() {
+  if (!mode2d) return;
+  view2d.querySelectorAll('[data-k]').forEach(el => {
+    const k = el.dataset.k, cid = +el.dataset.c, s = +el.dataset.s;
+    const search = sel.type === 'search';
+    el.classList.toggle('hit', search && searchHits.has(k));
+    el.classList.toggle('dim', search && !searchHits.has(k));
+    el.classList.toggle('sel', !search && cid === selCell && s === selSlot);
+    el.classList.toggle('multi', !search && cid !== selCell && multi.has(cid));
+    el.classList.toggle('insel', !search && cid === selCell && s !== selSlot);
+  });
+}
+
+function tipHtml(c, slot) {
+  const b = M.box.get(c.box_id), items = slotItems(c.id, slot);
+  return `<div class="h"><span>${slotCode(c, slot)}</span>${esc(c.label || b.name)}</div>` +
+    (items.length ? `<ul>${items.slice(0, 6).map(i => `<li><span>${esc(i.name)}</span>${i.qty ? ' · ' + esc(i.qty) : ''}${(i.links || []).length ? ' ' + i.links.map(l => LT[l.type]?.ico || '🔗').join('') : ''}${(i.tags || []).length ? `<div class="tags tip-tags">${i.tags.map(t => tagChip(t)).join('')}</div>` : ''}</li>`).join('')}${items.length > 6 ? `<li>… ${items.length - 6} weitere</li>` : ''}</ul>` : '<div style="color:var(--dim)">leer</div>');
+}
+function placeTip(e) {
+  const tip = $('#tip'), vr = view.getBoundingClientRect();
+  tip.classList.remove('hidden');
+  tip.style.left = Math.min(e.clientX - vr.left + 14, vr.width - tip.offsetWidth - 8) + 'px';
+  tip.style.top = Math.min(e.clientY - vr.top + 14, vr.height - tip.offsetHeight - 8) + 'px';
+}
+
+view2d.addEventListener('click', e => {
+  const el = e.target.closest('[data-k]'); if (!el) return;
+  const cid = +el.dataset.c, s = +el.dataset.s, bid = +el.dataset.b;
+  if (sel.type === 'box' && sel.id === bid) setCell(cid, e.shiftKey || e.ctrlKey || e.metaKey, s);
+  else select('box', bid, cid, { slot: s });
+});
+view2d.addEventListener('pointermove', e => {
+  const el = e.target.closest('[data-k]');
+  if (!el || e.pointerType === 'touch') { $('#tip').classList.add('hidden'); return; }
+  $('#tip').innerHTML = tipHtml(M.cell.get(+el.dataset.c), +el.dataset.s); placeTip(e);
+});
+view2d.addEventListener('pointerleave', () => $('#tip').classList.add('hidden'));
+
+function setMode2d(on) {
+  mode2d = on; store.set('mode2d', on);
+  document.body.classList.toggle('mode2d', on);
+  $('#view-2d').textContent = on ? '3D' : '2D';
+  $('#view-2d').title = on ? 'Zur 3D-Ansicht wechseln' : 'Zur flachen 2D-Draufsicht wechseln';
+  $('#tip').classList.add('hidden');
+  render3D();
 }
 
 function fitCamera(mode) {
@@ -1215,6 +1442,7 @@ function fitCamera(mode) {
 }
 
 function updateHighlights() {
+  update2D();
   for (const [key, m] of cellMeshes) {
     const { cellId, slot } = m.userData;
     const active = cellId === selCell && slot === selSlot;
@@ -1237,7 +1465,13 @@ function updateHighlights() {
   }
 }
 
-function pulseCell(id, slot = 0) { pulse = { id: `${id}:${slot}`, t0: performance.now() }; }
+function pulseCell(id, slot = 0) {
+  pulse = { id: `${id}:${slot}`, t0: performance.now() };
+  if (mode2d) {
+    const el = view2d.querySelector(`[data-k="${id}:${slot}"]`);
+    if (el) { el.classList.remove('pulse'); void el.offsetWidth; el.classList.add('pulse'); setTimeout(() => el.classList.remove('pulse'), 2700); }
+  }
+}
 
 /* ---------- Interaktion ---------- */
 const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
@@ -1266,27 +1500,24 @@ canvas.addEventListener('pointermove', e => {
   if (key !== hoverCell) { hoverCell = key; updateHighlights(); }
   const tip = $('#tip');
   if (!key) { tip.classList.add('hidden'); return; }
-  const c = M.cell.get(hit.cellId), b = M.box.get(c.box_id), items = slotItems(c.id, hit.slot);
-  tip.innerHTML = `<div class="h"><span>${slotCode(c, hit.slot)}</span>${esc(c.label || b.name)}</div>` +
-    (items.length ? `<ul>${items.slice(0, 6).map(i => `<li><span>${esc(i.name)}</span>${i.qty ? ' · ' + esc(i.qty) : ''}${(i.links || []).length ? ' ' + i.links.map(l => LT[l.type]?.ico || '🔗').join('') : ''}${(i.tags || []).length ? `<div class="tags tip-tags">${i.tags.map(t => tagChip(t)).join('')}</div>` : ''}</li>`).join('')}${items.length > 6 ? `<li>… ${items.length - 6} weitere</li>` : ''}</ul>` : '<div style="color:var(--dim)">leer</div>');
-  const vr = view.getBoundingClientRect();
-  tip.classList.remove('hidden');
-  const tx = Math.min(e.clientX - vr.left + 14, vr.width - tip.offsetWidth - 8);
-  const ty = Math.min(e.clientY - vr.top + 14, vr.height - tip.offsetHeight - 8);
-  tip.style.left = tx + 'px'; tip.style.top = ty + 'px';
+  tip.innerHTML = tipHtml(M.cell.get(hit.cellId), hit.slot);
+  placeTip(e);
 });
 canvas.addEventListener('pointerleave', () => { $('#tip').classList.add('hidden'); if (hoverCell) { hoverCell = null; updateHighlights(); } });
 
 $('#fit').onclick = () => fitCamera();
 $('#view-front').onclick = () => fitCamera('front');
 $('#view-top').onclick = () => fitCamera('top');
+$('#view-2d').onclick = () => setMode2d(!mode2d);
 
 new ResizeObserver(() => {
   const w = view.clientWidth, h = view.clientHeight; if (!w || !h) return;
   renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+  layout2D();
 }).observe(view);
 
 renderer.setAnimationLoop(now => {
+  if (mode2d) return;  // in 2D nichts rendern (spart Strom)
   controls.update();
   if (pulse) {
     const m = cellMeshes.get(pulse.id), dt = now - pulse.t0;
@@ -1315,13 +1546,15 @@ function runSearch() {
   const match = x => matchWords(words, x || '');
   results = [];
   const hits = findItems({ q });
-  const boxN = new Set(hits.map(i => M.cell.get(i.cell_id).box_id)).size;
-  if (hits.length > 1) results.push({ k: '3D', t: `Alle ${hits.length} Treffer zeigen`, s: `in ${boxN} ${boxN === 1 ? 'Kasten' : 'Kästen'} markieren`, all: true, go: () => showSearch({ q: sIn.value.trim() }) });
+  const lc = findLabelCells({ q }, hits);
+  const boxN = new Set([...hits.map(i => M.cell.get(i.cell_id).box_id), ...lc.map(c => c.box_id)]).size;
+  const nHits = hits.length + lc.length;
+  if (nHits > 1) results.push({ k: '3D', t: `Alle ${nHits} Treffer zeigen`, s: `in ${boxN} ${boxN === 1 ? 'Kasten' : 'Kästen'} markieren`, all: true, go: () => showSearch({ q: sIn.value.trim() }) });
   for (const t of D.tags) if (match(`${t.name} ${t.synonyms}`))
     results.push({ k: 'Label', t: t.name, s: tagPath(t.id), go: () => showSearch({ tag: t.id }) });
   for (const i of hits)
     results.push({ k: 'Teil', t: i.name + (i.qty ? ` · ${i.qty}` : ''), s: cellPath(M.cell.get(i.cell_id), i.slot || 0), go: () => goCell(i.cell_id, i.slot || 0) });
-  for (const c of D.cells) if (c.label && match(c.label))
+  for (const c of lc)
     results.push({ k: 'Fach', t: c.label, s: cellPath(c), go: () => goCell(c.id) });
   for (const b of D.boxes) if (match(b.name + ' ' + b.notes))
     results.push({ k: 'Kasten', t: b.name, s: areaPath(b.area_id), go: () => select('box', b.id) });
@@ -1362,11 +1595,12 @@ document.addEventListener('keydown', e => {
 $('#add-area').onclick = () => addArea(null);
 $('#add-box').onclick = () => addBox(sel.type === 'area' ? sel.id : sel.type === 'box' ? M.box.get(sel.id).area_id : null);
 $('#toggle-tree').onclick = () => document.body.classList.toggle('tree-open');
-$('#import-btn').onclick = () => $('#import-file').click();
-$('#import-file').onchange = async e => {
-  const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+$('#import-file').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  toast(`Lese „${f.name}“ …`);
   let data;
-  try { data = JSON.parse(await f.text()); } catch { return toast('Die Datei ist kein gültiges JSON.', true); }
+  try { data = JSON.parse(await f.text()); } catch { e.target.value = ''; return toast('Die Datei ist kein gültiges JSON (vielleicht eine HTML-Seite statt des Exports?).', true); }
+  e.target.value = '';
   if (!Array.isArray(data?.areas) || !Array.isArray(data?.items)) return toast('Das ist keine Fachfinder-Exportdatei.', true);
   const ok = await dialog({
     title: 'Daten importieren?',
@@ -1379,7 +1613,7 @@ $('#import-file').onchange = async e => {
   sel = { type: null, id: null }; selCell = null; panelMode = null;
   await reload(); writeHash();
   toast(`Import fertig: ${r.items} Teile in ${r.boxes} Kästen. Sicherung: ${r.backup}`);
-};
+});
 $('#open-tags').onclick = () => { panelMode = panelMode === 'tags' ? null : 'tags'; renderPanel(); };
 
 async function checkVersion() {
@@ -1394,6 +1628,8 @@ async function checkVersion() {
 }
 
 (async () => {
+  document.body.classList.toggle('mode2d', mode2d);
+  $('#view-2d').textContent = mode2d ? '3D' : '2D';
   await reload();
   checkVersion();
   const h = readHash() || store.get('sel', null);

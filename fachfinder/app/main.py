@@ -23,8 +23,8 @@ BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
 DB_PATH = Path(os.environ.get("FACHFINDER_DB", BASE / "data" / "fachfinder.db"))
 
-APP_VERSION = "1.1.0"  # muss zu APP_VERSION in static/app.js passen
-MAX_GRID = 40
+APP_VERSION = "1.2.0"  # muss zu APP_VERSION in static/app.js passen
+MAX_GRID = 60
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS areas(
@@ -105,7 +105,10 @@ def _migrate(con):
     def cols(t):
         return {r[1] for r in con.execute(f"PRAGMA table_info({t})")}
     add = {
-        "cells": [("sub_rows", "INTEGER NOT NULL DEFAULT 1"), ("sub_cols", "INTEGER NOT NULL DEFAULT 1")],
+        "cells": [("sub_rows", "INTEGER NOT NULL DEFAULT 1"), ("sub_cols", "INTEGER NOT NULL DEFAULT 1"),
+                  ("gap", "INTEGER NOT NULL DEFAULT 0")],
+        "boxes": [("col_w", "TEXT NOT NULL DEFAULT ''"), ("row_h", "TEXT NOT NULL DEFAULT ''"),
+                  ("label_pos", "TEXT NOT NULL DEFAULT 'unten'")],
         "items": [("slot", "INTEGER NOT NULL DEFAULT 0"), ("links", "TEXT NOT NULL DEFAULT '[]'"),
                   ("props", "TEXT NOT NULL DEFAULT '[]'")],
     }
@@ -121,6 +124,16 @@ with db() as _c:
     _migrate(_c)
 
 app = FastAPI(title="Fachfinder", docs_url="/api/docs", redoc_url=None)
+
+
+@app.middleware("http")
+async def no_stale_static(request, call_next):
+    """Browser sollen Oberflächen-Dateien immer neu prüfen (ETag) – sonst läuft nach einem
+    Update eine Mischung aus alten und neuen Dateien."""
+    resp = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 # --------------------------------------------------------------------------- models
@@ -156,6 +169,7 @@ class BoxPatch(BaseModel):
     orientation: Optional[str] = Field(default=None, pattern="^(liegend|stehend)$")
     color: Optional[str] = Field(default=None, pattern="^#[0-9a-fA-F]{6}$")
     notes: Optional[str] = None
+    label_pos: Optional[str] = Field(default=None, pattern="^(unten|oben)$")  # Beschriftungsschild am Fach
 
 
 class LayoutCell(BaseModel):
@@ -165,12 +179,49 @@ class LayoutCell(BaseModel):
     rowspan: int = Field(default=1, ge=1)
     colspan: int = Field(default=1, ge=1)
     label: str = ""
+    gap: bool = False  # Aussparung: kein Fach (z. B. Griffmulde)
 
 
 class LayoutIn(BaseModel):
     rows: int = Field(ge=1, le=MAX_GRID)
     cols: int = Field(ge=1, le=MAX_GRID)
     cells: List[LayoutCell]
+    # Optionale Spaltenbreiten / Zeilenhöhen (relativ). Fehlt es oder ist alles gleich: gleichmäßiges Raster
+    col_w: Optional[List[float]] = None
+    row_h: Optional[List[float]] = None
+
+
+def _norm_fracs(v, n: int) -> list[float]:
+    """Relative Größen -> Anteile mit Summe 1. Ungültig/leer -> gleichmäßig."""
+    try:
+        v = [float(x) for x in (v or [])]
+    except (TypeError, ValueError):
+        v = []
+    if len(v) != n or any(x <= 0 for x in v):
+        return [1 / n] * n
+    s = sum(v)
+    return [x / s for x in v]
+
+
+def _fracs_db(v, n: int) -> str:
+    f = _norm_fracs(v, n)
+    if max(f) - min(f) < 1e-6:
+        return ""  # gleichmäßig -> nichts speichern
+    return json.dumps([round(x, 6) for x in f])
+
+
+def _fracs_load(s: str, n: int) -> list[float]:
+    try:
+        return _norm_fracs(json.loads(s) if s else None, n)
+    except ValueError:
+        return [1 / n] * n
+
+
+def _box_dict(r) -> dict:
+    d = dict(r)
+    d["col_w"] = _fracs_load(d.get("col_w") or "", d["cols"]) if d.get("col_w") else []
+    d["row_h"] = _fracs_load(d.get("row_h") or "", d["rows"]) if d.get("row_h") else []
+    return d
 
 
 MAX_SUB = 12
@@ -325,18 +376,20 @@ def _valid_slot(con, cell_id: int, slot: int) -> int:
     row = con.execute("SELECT sub_rows, sub_cols FROM cells WHERE id=?", (cell_id,)).fetchone()
     if row is None:
         raise HTTPException(400, "Fach existiert nicht")
+    if con.execute("SELECT gap FROM cells WHERE id=?", (cell_id,)).fetchone()["gap"]:
+        raise HTTPException(400, "Das ist eine Aussparung, kein Fach")
     return slot if 0 <= slot < row["sub_rows"] * row["sub_cols"] else 0
 
 
 def _all_data(con) -> dict:
     return {
         "areas": [dict(r) for r in con.execute("SELECT id,parent_id,name FROM areas")],
-        "boxes": [dict(r) for r in con.execute("SELECT * FROM boxes")],
+        "boxes": [_box_dict(r) for r in con.execute("SELECT * FROM boxes")],
         "cells": [
             dict(r)
             for r in con.execute(
                 "SELECT id,box_id,row_i AS row,col_i AS col,row_span AS rowspan,"
-                "col_span AS colspan,label,sub_rows,sub_cols FROM cells"
+                "col_span AS colspan,label,sub_rows,sub_cols,gap FROM cells"
             )
         ],
         "items": _items_with_tags(con),
@@ -414,17 +467,20 @@ def import_data(data: dict):
                             (t["id"], t["name"], t["parent_id"], t.get("color") or "#6c8ebf", t.get("synonyms") or ""))
             for b in data["boxes"]:
                 con.execute(
-                    "INSERT INTO boxes(id,area_id,name,rows,cols,width,depth,height,orientation,color,notes) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO boxes(id,area_id,name,rows,cols,width,depth,height,orientation,color,notes,col_w,row_h,label_pos) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (b["id"], b["area_id"], b["name"], b.get("rows", 4), b.get("cols", 6), b.get("width", 400),
                      b.get("depth", 300), b.get("height", 60), b.get("orientation", "liegend"),
-                     b.get("color", "#4f7cac"), b.get("notes", "")))
+                     b.get("color", "#4f7cac"), b.get("notes", ""),
+                     _fracs_db(b.get("col_w"), b.get("cols", 6)) if b.get("col_w") else "",
+                     _fracs_db(b.get("row_h"), b.get("rows", 4)) if b.get("row_h") else "",
+                     b.get("label_pos") if b.get("label_pos") in ("unten", "oben") else "unten"))
             for c in data["cells"]:
                 con.execute(
-                    "INSERT INTO cells(id,box_id,row_i,col_i,row_span,col_span,label,sub_rows,sub_cols) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO cells(id,box_id,row_i,col_i,row_span,col_span,label,sub_rows,sub_cols,gap) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (c["id"], c["box_id"], c["row"], c["col"], c.get("rowspan", 1), c.get("colspan", 1),
-                     c.get("label", ""), c.get("sub_rows", 1), c.get("sub_cols", 1)))
+                     c.get("label", ""), c.get("sub_rows", 1), c.get("sub_cols", 1), int(bool(c.get("gap")))))
             tag_ids = {t["id"] for t in tags}
             for i in data["items"]:
                 con.execute(
@@ -526,34 +582,93 @@ def set_layout(box_id: int, lay: LayoutIn):
     if any(v is None for line in grid for v in line):
         raise HTTPException(400, "Raster ist nicht vollständig mit Fächern belegt")
 
+    new_cw, new_rh = _norm_fracs(lay.col_w, cols), _norm_fracs(lay.row_h, rows)
+
+    def edges(f):
+        out, acc = [0.0], 0.0
+        for x in f:
+            acc += x; out.append(acc)
+        return out
+
+    def index_at(e, p):  # Rasterindex, in dem Position p (0..1) liegt
+        for i in range(len(e) - 1):
+            if p < e[i + 1]:
+                return i
+        return len(e) - 2
+
     with db() as con:
-        if not _exists(con, "boxes", box_id):
+        box = con.execute("SELECT rows, cols, col_w, row_h FROM boxes WHERE id=?", (box_id,)).fetchone()
+        if box is None:
             raise HTTPException(404, "Kasten nicht gefunden")
+        oxe = edges(_fracs_load(box["col_w"], box["cols"]))
+        oye = edges(_fracs_load(box["row_h"], box["rows"]))
+        nxe, nye = edges(new_cw), edges(new_rh)
         old = {r["id"]: r for r in con.execute("SELECT * FROM cells WHERE box_id=?", (box_id,))}
         new_ids: list[int] = []
         used: set[int] = set()
         for c in lay.cells:
             if c.id in old and c.id not in used:
                 con.execute(
-                    "UPDATE cells SET row_i=?,col_i=?,row_span=?,col_span=?,label=? WHERE id=?",
-                    (c.row, c.col, c.rowspan, c.colspan, c.label, c.id),
+                    "UPDATE cells SET row_i=?,col_i=?,row_span=?,col_span=?,label=?,gap=? WHERE id=?",
+                    (c.row, c.col, c.rowspan, c.colspan, c.label, int(c.gap), c.id),
                 )
                 new_ids.append(c.id)
                 used.add(c.id)
             else:
                 cur = con.execute(
-                    "INSERT INTO cells(box_id,row_i,col_i,row_span,col_span,label) VALUES(?,?,?,?,?,?)",
-                    (box_id, c.row, c.col, c.rowspan, c.colspan, c.label),
+                    "INSERT INTO cells(box_id,row_i,col_i,row_span,col_span,label,gap) VALUES(?,?,?,?,?,?,?)",
+                    (box_id, c.row, c.col, c.rowspan, c.colspan, c.label, int(c.gap)),
                 )
                 new_ids.append(cur.lastrowid)
         for oid, o in old.items():
             if oid in used:
                 continue
-            target = new_ids[grid[min(o["row_i"], rows - 1)][min(o["col_i"], cols - 1)]]
+            # Inhalt wandert in das Fach, das jetzt an der Stelle der Mitte des alten Fachs liegt
+            r0, c0 = min(o["row_i"], len(oye) - 2), min(o["col_i"], len(oxe) - 2)
+            r1, c1 = min(r0 + o["row_span"], len(oye) - 1), min(c0 + o["col_span"], len(oxe) - 1)
+            px, py = (oxe[c0] + oxe[c1]) / 2, (oye[r0] + oye[r1]) / 2
+            target = new_ids[grid[index_at(nye, py)][index_at(nxe, px)]]
             con.execute("UPDATE items SET cell_id=?, slot=0 WHERE cell_id=?", (target, oid))
             con.execute("DELETE FROM cells WHERE id=?", (oid,))
-        con.execute("UPDATE boxes SET rows=?, cols=? WHERE id=?", (rows, cols, box_id))
+        # Aussparungen mit Inhalt (z. B. nach Verkleinern) werden wieder normale Fächer – es geht nichts verloren
+        con.execute("UPDATE cells SET gap=0 WHERE box_id=? AND gap=1 AND id IN (SELECT cell_id FROM items)", (box_id,))
+        con.execute("UPDATE cells SET label='', sub_rows=1, sub_cols=1 WHERE box_id=? AND gap=1", (box_id,))
+        con.execute("UPDATE boxes SET rows=?, cols=?, col_w=?, row_h=? WHERE id=?",
+                    (rows, cols, _fracs_db(new_cw, cols), _fracs_db(new_rh, rows), box_id))
     return {"ok": True}
+
+
+def _tidy_cell(con, cell_id: int) -> str:
+    """Fach mit Beschriftung, aber ohne Inhalt: Beschriftung wird zum Inhalt.
+    Fach, dessen einziger Inhalt genauso heißt wie die Beschriftung: Beschriftung entfällt."""
+    c = con.execute("SELECT label, gap FROM cells WHERE id=?", (cell_id,)).fetchone()
+    if c is None:
+        raise HTTPException(404, "Fach nicht gefunden")
+    label = (c["label"] or "").strip()
+    if not label or c["gap"]:
+        return ""
+    items = con.execute("SELECT name FROM items WHERE cell_id=?", (cell_id,)).fetchall()
+    if not items:
+        con.execute("INSERT INTO items(cell_id,slot,name) VALUES(?,0,?)", (cell_id, label))
+        con.execute("UPDATE cells SET label='' WHERE id=?", (cell_id,))
+        return "converted"
+    if len(items) == 1 and items[0]["name"].strip().lower() == label.lower():
+        con.execute("UPDATE cells SET label='' WHERE id=?", (cell_id,))
+        return "cleared"
+    return ""
+
+
+@app.post("/api/cells/{cell_id}/tidy")
+def tidy_cell(cell_id: int):
+    with db() as con:
+        return {"result": _tidy_cell(con, cell_id)}
+
+
+@app.post("/api/boxes/{box_id}/tidy")
+def tidy_box(box_id: int):
+    with db() as con:
+        res = [_tidy_cell(con, r["id"]) for r in con.execute("SELECT id FROM cells WHERE box_id=?", (box_id,)).fetchall()]
+    return {"converted": res.count("converted"), "cleared": res.count("cleared")}
 
 
 # ---- Fächer
@@ -688,11 +803,17 @@ def search(q: str):
         for r in con.execute("SELECT item_id, tag_id FROM item_tags"):
             item_tags.setdefault(r["item_id"], []).append(r["tag_id"])
         tag_names = {r["id"]: r["name"] for r in con.execute("SELECT id, name FROM tags")}
+        codes = _cell_codes(con)
         rows = con.execute(
             """SELECT i.id, i.name, i.qty, i.notes, i.slot, i.links, i.props, c.id AS cell_id, c.row_i, c.col_i,
                       c.label, c.sub_rows, c.sub_cols, b.id AS box_id, b.name AS box, a.name AS area
                FROM items i JOIN cells c ON c.id=i.cell_id JOIN boxes b ON b.id=c.box_id
                JOIN areas a ON a.id=b.area_id"""
+        ).fetchall()
+        cells = con.execute(
+            """SELECT c.id, c.row_i, c.col_i, c.label, b.id AS box_id, b.name AS box, a.name AS area
+               FROM cells c JOIN boxes b ON b.id=c.box_id JOIN areas a ON a.id=b.area_id
+               WHERE c.gap=0 AND c.label<>''"""
         ).fetchall()
     out = []
     for r in rows:
@@ -703,7 +824,7 @@ def search(q: str):
         tagtxt = " ".join(terms.get(t, "") for t in tids)
         hay = f"{r['name']} {r['qty']} {r['notes']} {r['label']} {props} {links} {tagtxt}"
         if matches(words, hay):
-            code = _row_letter(r["row_i"]) + str(r["col_i"] + 1)
+            code = codes[r["cell_id"]]
             if r["sub_rows"] * r["sub_cols"] > 1:
                 code += f".{r['slot'] + 1}"
             out.append({
@@ -712,6 +833,32 @@ def search(q: str):
                 "links": it["links"], "props": it["props"], "tags": [tag_names[t] for t in tids],
                 "link": f"#box={r['box_id']}&cell={r['cell_id']}&slot={r['slot']}",
             })
+    # Fächer, die nur über ihre Beschriftung passen (und nicht schon über ein Teil gefunden wurden)
+    hit_cells = {o["cell_id"] for o in out}
+    for c in cells:
+        if c["id"] in hit_cells or not c["label"] or not matches(words, c["label"]):
+            continue
+        out.append({
+            "item": c["label"], "qty": "", "area": c["area"], "box": c["box"],
+            "fach": codes[c["id"]], "box_id": c["box_id"], "cell_id": c["id"],
+            "slot": 0, "links": [], "props": [], "tags": [],
+            "link": f"#box={c['box_id']}&cell={c['id']}&slot=0",
+        })
+    return out
+
+
+def _cell_codes(con) -> dict[int, str]:
+    """Fachnamen. Gleichmäßiges Raster: Zeilenbuchstabe + Spalte (wie bisher).
+    Exakt angepasste Kästen: Reihen fortlaufend A, B, C …, darin von links nach rechts 1, 2, 3 …"""
+    exact = {r["id"] for r in con.execute("SELECT id FROM boxes WHERE col_w<>'' OR row_h<>''")}
+    cells = con.execute("SELECT id, box_id, row_i, col_i, gap FROM cells").fetchall()
+    out = {c["id"]: _row_letter(c["row_i"]) + str(c["col_i"] + 1) for c in cells}
+    for bid in exact:
+        bc = [c for c in cells if c["box_id"] == bid and not c["gap"]]
+        rows = sorted({c["row_i"] for c in bc})
+        for ri, r in enumerate(rows):
+            for k, c in enumerate(sorted((c for c in bc if c["row_i"] == r), key=lambda c: c["col_i"])):
+                out[c["id"]] = _row_letter(ri) + str(k + 1)
     return out
 
 
@@ -797,6 +944,9 @@ def demo():
 
         # Labels mit Hierarchie und Synonymen
         def tag(name, parent=None, color="#6c8ebf", syn=""):
+            row = con.execute("SELECT id FROM tags WHERE name=?", (name,)).fetchone()
+            if row:  # Label gibt es schon (Name ohne Groß/Klein) → wiederverwenden
+                return row[0]
             return con.execute("INSERT INTO tags(name,parent_id,color,synonyms) VALUES(?,?,?,?)",
                                (name, parent, color, syn)).lastrowid
         sv = tag("Spannungsversorgung", None, "#c9a227", "Spannungswandler, Regler, Netzteil, Stromversorgung")
