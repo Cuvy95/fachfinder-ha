@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.1
+- **Doppelseitige Sortierkästen**: Beim Anlegen „Doppelseitig“ wählen oder bei einem bestehenden Kasten „⇅ Rückseite anlegen“. Seite B hat ein eigenes Raster, eigene Fächer und eigenen Inhalt (wahlweise mit der Fachaufteilung von Seite A als Vorlage)
+- Name, Bereich, Bauform, Farbe und Maße gelten für beide Seiten; Wandhöhe, Beschriftungsschild und Notiz hat jede Seite für sich
+- Umschalter „Seite A / Seite B“ im Kasten, beide Seiten erscheinen in 2D und 3D nebeneinander, im Baum steht der Kasten einmal mit „A|B“
+- Suche, Tooltips und Verschieben zeigen die Seite an (z. B. „Elektronik · Seite B › B3“). Die Such-API liefert zusätzlich `side` und hängt „(Seite B)“ an den Kastennamen an
+- Export/Import enthält die Seiten; ältere Exporte funktionieren weiter
+
 ## 1.2.0
 - **2D-Draufsicht**: Mit dem Knopf „2D“ oben rechts wechselst du zwischen 3D und einer flachen Draufsicht. Bestücken, Trenner, Mehrfachauswahl und Suche funktionieren dort genauso. Die Wahl wird gemerkt
 - **Beschriftungsschild oben oder unten** pro Kasten einstellbar (Standard: unten/vorne), in 2D und 3D einheitlich

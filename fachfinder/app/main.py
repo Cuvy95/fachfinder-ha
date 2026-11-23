@@ -23,7 +23,7 @@ BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
 DB_PATH = Path(os.environ.get("FACHFINDER_DB", BASE / "data" / "fachfinder.db"))
 
-APP_VERSION = "1.2.0"  # muss zu APP_VERSION in static/app.js passen
+APP_VERSION = "1.2.1"  # muss zu APP_VERSION in static/app.js passen
 MAX_GRID = 60
 
 SCHEMA = """
@@ -108,7 +108,9 @@ def _migrate(con):
         "cells": [("sub_rows", "INTEGER NOT NULL DEFAULT 1"), ("sub_cols", "INTEGER NOT NULL DEFAULT 1"),
                   ("gap", "INTEGER NOT NULL DEFAULT 0")],
         "boxes": [("col_w", "TEXT NOT NULL DEFAULT ''"), ("row_h", "TEXT NOT NULL DEFAULT ''"),
-                  ("label_pos", "TEXT NOT NULL DEFAULT 'unten'")],
+                  ("label_pos", "TEXT NOT NULL DEFAULT 'unten'"),
+                  # Doppelseitige Kästen: die Rückseite (Seite B) ist ein eigener Kasten mit pair_id = Vorderseite
+                  ("pair_id", "INTEGER REFERENCES boxes(id) ON DELETE CASCADE")],
         "items": [("slot", "INTEGER NOT NULL DEFAULT 0"), ("links", "TEXT NOT NULL DEFAULT '[]'"),
                   ("props", "TEXT NOT NULL DEFAULT '[]'")],
     }
@@ -117,6 +119,7 @@ def _migrate(con):
         for name, decl in columns:
             if name not in have:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_boxes_pair ON boxes(pair_id)")
 
 
 with db() as _c:
@@ -170,6 +173,17 @@ class BoxPatch(BaseModel):
     color: Optional[str] = Field(default=None, pattern="^#[0-9a-fA-F]{6}$")
     notes: Optional[str] = None
     label_pos: Optional[str] = Field(default=None, pattern="^(unten|oben)$")  # Beschriftungsschild am Fach
+
+
+class BackIn(BaseModel):
+    """Rückseite anlegen: gleiche Fachaufteilung wie Seite A oder einfaches Raster."""
+    copy_layout: bool = True
+    rows: int = Field(default=4, ge=1, le=MAX_GRID)
+    cols: int = Field(default=6, ge=1, le=MAX_GRID)
+
+
+# Eigenschaften, die Vorder- und Rückseite gemeinsam haben (es ist ja ein Gehäuse)
+SHARED_BOX_FIELDS = ("area_id", "name", "width", "depth", "orientation", "color")
 
 
 class LayoutCell(BaseModel):
@@ -305,6 +319,17 @@ def _patch(con, table: str, row_id: int, data: dict):
 
 def _exists(con, table: str, row_id: int) -> bool:
     return con.execute(f"SELECT 1 FROM {table} WHERE id=?", (row_id,)).fetchone() is not None
+
+
+def _partner(con, box_id: int) -> Optional[int]:
+    """Andere Seite eines doppelseitigen Kastens (oder None)."""
+    row = con.execute("SELECT pair_id FROM boxes WHERE id=?", (box_id,)).fetchone()
+    if row is None:
+        return None
+    if row["pair_id"] is not None:
+        return row["pair_id"]
+    back = con.execute("SELECT id FROM boxes WHERE pair_id=?", (box_id,)).fetchone()
+    return back["id"] if back else None
 
 
 def _create_default_cells(con, box_id: int, rows: int, cols: int):
@@ -465,16 +490,24 @@ def import_data(data: dict):
             for t in topo(tags):
                 con.execute("INSERT INTO tags(id,name,parent_id,color,synonyms) VALUES(?,?,?,?,?)",
                             (t["id"], t["name"], t["parent_id"], t.get("color") or "#6c8ebf", t.get("synonyms") or ""))
+            # Rückseiten nach ihrer Vorderseite einfügen; ungültige Paare werden zu normalen Kästen
+            fronts = {b["id"] for b in data["boxes"] if b.get("pair_id") is None}
+            taken: set = set()
             for b in data["boxes"]:
+                p = b.get("pair_id")
+                b["pair_id"] = p if p in fronts and p not in taken and p != b["id"] else None
+                if b["pair_id"] is not None:
+                    taken.add(p)
+            for b in sorted(data["boxes"], key=lambda b: b["pair_id"] is not None):
                 con.execute(
-                    "INSERT INTO boxes(id,area_id,name,rows,cols,width,depth,height,orientation,color,notes,col_w,row_h,label_pos) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO boxes(id,area_id,name,rows,cols,width,depth,height,orientation,color,notes,col_w,row_h,label_pos,pair_id) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (b["id"], b["area_id"], b["name"], b.get("rows", 4), b.get("cols", 6), b.get("width", 400),
                      b.get("depth", 300), b.get("height", 60), b.get("orientation", "liegend"),
                      b.get("color", "#4f7cac"), b.get("notes", ""),
                      _fracs_db(b.get("col_w"), b.get("cols", 6)) if b.get("col_w") else "",
                      _fracs_db(b.get("row_h"), b.get("rows", 4)) if b.get("row_h") else "",
-                     b.get("label_pos") if b.get("label_pos") in ("unten", "oben") else "unten"))
+                     b.get("label_pos") if b.get("label_pos") in ("unten", "oben") else "unten", b["pair_id"]))
             for c in data["cells"]:
                 con.execute(
                     "INSERT INTO cells(id,box_id,row_i,col_i,row_span,col_span,label,sub_rows,sub_cols,gap) "
@@ -554,7 +587,37 @@ def update_box(box_id: int, b: BoxPatch):
         if "area_id" in data and not _exists(con, "areas", data["area_id"]):
             raise HTTPException(400, "Bereich existiert nicht")
         _patch(con, "boxes", box_id, data)
+        shared = {k: v for k, v in data.items() if k in SHARED_BOX_FIELDS}
+        other = _partner(con, box_id)
+        if shared and other is not None:
+            _patch(con, "boxes", other, shared)
     return {"ok": True}
+
+
+@app.post("/api/boxes/{box_id}/back")
+def create_back(box_id: int, body: BackIn):
+    """Macht einen Kasten doppelseitig: legt die Rückseite (Seite B) an."""
+    with db() as con:
+        a = con.execute("SELECT * FROM boxes WHERE id=?", (box_id,)).fetchone()
+        if a is None:
+            raise HTTPException(404, "Kasten nicht gefunden")
+        if a["pair_id"] is not None or _partner(con, box_id) is not None:
+            raise HTTPException(400, "Dieser Kasten hat schon zwei Seiten")
+        rows, cols = (a["rows"], a["cols"]) if body.copy_layout else (body.rows, body.cols)
+        cur = con.execute(
+            "INSERT INTO boxes(area_id,name,rows,cols,width,depth,height,orientation,color,notes,col_w,row_h,label_pos,pair_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,'',?,?,?,?)",
+            (a["area_id"], a["name"], rows, cols, a["width"], a["depth"], a["height"], a["orientation"], a["color"],
+             a["col_w"] if body.copy_layout else "", a["row_h"] if body.copy_layout else "", a["label_pos"], box_id))
+        bid = cur.lastrowid
+        if body.copy_layout:
+            con.execute(
+                "INSERT INTO cells(box_id,row_i,col_i,row_span,col_span,label,sub_rows,sub_cols,gap) "
+                "SELECT ?,row_i,col_i,row_span,col_span,'',sub_rows,sub_cols,gap FROM cells WHERE box_id=? ORDER BY id",
+                (bid, box_id))
+        else:
+            _create_default_cells(con, bid, rows, cols)
+        return {"id": bid}
 
 
 @app.delete("/api/boxes/{box_id}")
@@ -804,6 +867,7 @@ def search(q: str):
             item_tags.setdefault(r["item_id"], []).append(r["tag_id"])
         tag_names = {r["id"]: r["name"] for r in con.execute("SELECT id, name FROM tags")}
         codes = _cell_codes(con)
+        side = _box_sides(con)
         rows = con.execute(
             """SELECT i.id, i.name, i.qty, i.notes, i.slot, i.links, i.props, c.id AS cell_id, c.row_i, c.col_i,
                       c.label, c.sub_rows, c.sub_cols, b.id AS box_id, b.name AS box, a.name AS area
@@ -828,8 +892,8 @@ def search(q: str):
             if r["sub_rows"] * r["sub_cols"] > 1:
                 code += f".{r['slot'] + 1}"
             out.append({
-                "item": r["name"], "qty": r["qty"], "area": r["area"], "box": r["box"],
-                "fach": code, "box_id": r["box_id"], "cell_id": r["cell_id"], "slot": r["slot"],
+                "item": r["name"], "qty": r["qty"], "area": r["area"], "box": _side_name(r["box"], side, r["box_id"]),
+                "side": side.get(r["box_id"], ""), "fach": code, "box_id": r["box_id"], "cell_id": r["cell_id"], "slot": r["slot"],
                 "links": it["links"], "props": it["props"], "tags": [tag_names[t] for t in tids],
                 "link": f"#box={r['box_id']}&cell={r['cell_id']}&slot={r['slot']}",
             })
@@ -839,12 +903,25 @@ def search(q: str):
         if c["id"] in hit_cells or not c["label"] or not matches(words, c["label"]):
             continue
         out.append({
-            "item": c["label"], "qty": "", "area": c["area"], "box": c["box"],
-            "fach": codes[c["id"]], "box_id": c["box_id"], "cell_id": c["id"],
+            "item": c["label"], "qty": "", "area": c["area"], "box": _side_name(c["box"], side, c["box_id"]),
+            "side": side.get(c["box_id"], ""), "fach": codes[c["id"]], "box_id": c["box_id"], "cell_id": c["id"],
             "slot": 0, "links": [], "props": [], "tags": [],
             "link": f"#box={c['box_id']}&cell={c['id']}&slot=0",
         })
     return out
+
+
+def _box_sides(con) -> dict[int, str]:
+    """Kasten-ID -> 'A' / 'B' für doppelseitige Kästen (einseitige fehlen)."""
+    out = {}
+    for r in con.execute("SELECT id, pair_id FROM boxes WHERE pair_id IS NOT NULL"):
+        out[r["id"]] = "B"
+        out[r["pair_id"]] = "A"
+    return out
+
+
+def _side_name(name: str, side: dict[int, str], box_id: int) -> str:
+    return f"{name} (Seite {side[box_id]})" if box_id in side else name
 
 
 def _cell_codes(con) -> dict[int, str]:
@@ -938,6 +1015,18 @@ def demo():
         b3 = box(wand, "Kabelkram", 2, 3, 360, 200, 120, "stehend", "#5b8c4a")
         put(b3, 0, 0, ("USB-C Kabel", "5"))
         put(b3, 1, 2, ("Aderendhülsen 0,75–2,5 mm²", "Box"))
+        # Doppelseitiger Sortierkasten: Seite B ist ein eigener Kasten mit pair_id
+        b4 = box(schrank, "Elektronik doppelseitig", 3, 4, 330, 220, 22, "liegend", "#8a5bb5")
+        b4b = con.execute(
+            "INSERT INTO boxes(area_id,name,rows,cols,width,depth,height,orientation,color,pair_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (schrank, "Elektronik doppelseitig", 2, 3, 330, 220, 22, "liegend", "#8a5bb5", b4)).lastrowid
+        _create_default_cells(con, b4b, 2, 3)
+        put(b4, 0, 0, ("LEDs 5 mm rot", "50"))
+        put(b4, 0, 1, ("LEDs 5 mm grün", "50"))
+        put(b4, 1, 0, ("Taster 6×6 mm", "30"))
+        put(b4b, 0, 0, ("Stiftleisten 2,54 mm", "20"))
+        put(b4b, 1, 2, ("JST-XH Stecker", "Sortiment"))
+
         put(b2, 0, 2, {"name": "LM7805 Festspannungsregler", "qty": "10",
                        "links": [{"type": "datenblatt", "label": "TI LM7805", "url": "https://www.ti.com/lit/ds/symlink/lm7805.pdf"}],
                        "props": [{"k": "Ausgang", "v": "5 V, max. 1,5 A"}, {"k": "Gehäuse", "v": "TO-220"}]})

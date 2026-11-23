@@ -5,6 +5,7 @@ Virtuelle Sortierkästen mit 3D-Ansicht. Nach dem Start erscheint **Fachfinder**
 ## Erste Schritte
 1. Links mit **+ Bereich** einen Raum anlegen, z. B. „Werkstatt“, und darunter z. B. „Wand links“.
 2. Mit **+ Kasten** einen Sortierkasten anlegen: Name, Bauform (liegend/stehend), Zeilen, Spalten und Maße.
+   Hat dein Kasten Fächer auf beiden Seiten? Wähle **Doppelseitig** oder leg später mit **⇅ Rückseite anlegen** die Seite B an. Oben im Kasten schaltest du zwischen Seite A und B um.
 3. Ein Fach anklicken und eintragen, was drin liegt. Über den Pfeil ▸ am Teil vergibst du Labels, Links und technische Daten.
 4. Oben suchen. Mit „Alle Treffer zeigen“ leuchten alle passenden Fächer in 3D.
 

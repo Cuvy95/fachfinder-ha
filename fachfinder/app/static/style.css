@@ -397,3 +397,11 @@ body.mode2d #c, body.mode2d #fit, body.mode2d #view-front, body.mode2d #view-top
 .s2.dim { opacity: .3; }
 .s2.pulse { animation: pulse2 .32s ease-in-out 8 alternate; }
 @keyframes pulse2 { from { box-shadow: inset 0 0 0 0 var(--accent); } to { box-shadow: inset 0 0 0 5px var(--accent), 0 0 14px var(--accent); } }
+
+/* Doppelseitige Kästen */
+.node .sides { font-size: 10px; font-weight: 700; color: var(--dim); border: 1px solid var(--line2); border-radius: 4px; padding: 0 4px; margin-left: 6px; line-height: 15px; }
+.side-sw { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+.side-sw button { flex: 1; min-width: 120px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 10px; border-radius: 7px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); font: inherit; font-size: 12.5px; cursor: pointer; }
+.side-sw button:hover { border-color: var(--line2); }
+.side-sw button.on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.side-sw button span { color: var(--dim); font-size: 11.5px; font-weight: 400; }

@@ -20,6 +20,7 @@ Voraussetzung ist Home Assistant OS oder Supervised (also mit Apps). Unterstütz
 - **Baumstruktur** wie im CAD-Programm: Bereiche (Räume, Wände, Schränke) beliebig verschachteln
 - **3D-Ansicht** jedes Kastens, liegend (Sortierkasten) oder stehend (Regal/Magazin), dreh- und zoombar
 - **Fächer verbinden und teilen**, Zeilen und Spalten frei wählbar
+- **Doppelseitige Sortierkästen**: Rückseite mit eigenem Raster und Inhalt, Umschalter Seite A/B, beide Seiten nebeneinander in 2D und 3D
 - **Trenner** pro Fach: Bereiche wie *A1.1, A1.2* und ein **Beschriftungsschild** vorne am Fach
 - Pro Teil: **Menge, Notiz, Links** (📄 Datenblatt, 🛒 Shop, ⚙️ Konfiguration, 📘 Doku) und **technische Daten**
 - **Labels mit Oberbegriffen und Synonymen**: „Spannungswandler“ findet z. B. alle Step-Down-, Step-Up- und Linearregler
@@ -63,6 +64,8 @@ actions:
       {% elif r | count == 1 %}{{ r[0].item }} liegt in {{ r[0].box }}, Fach {{ r[0].fach }}.
       {% else %}Ich habe {{ r | count }} Treffer: {% for t in r[:4] %}{{ t.item }} in {{ t.box }} Fach {{ t.fach }}{{ ', ' if not loop.last }}{% endfor %}.{% endif %}
 ```
+
+Bei doppelseitigen Kästen nennt die Antwort die Seite mit, z. B. „Elektronik (Seite B), Fach B3“. Die Seite allein steht zusätzlich im Feld `side` (`A`, `B` oder leer).
 
 ## Umzug von einer anderen Fachfinder-Installation
 

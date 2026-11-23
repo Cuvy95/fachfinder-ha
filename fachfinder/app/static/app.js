@@ -1,11 +1,11 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { openLayoutEditor } from './editor.js?v=1.2.0';
+import { openLayoutEditor } from './editor.js?v=1.2.1';
 
 /* =====================================================================
    Helfer
    ===================================================================== */
-const APP_VERSION = '1.2.0'; // muss zu APP_VERSION in main.py passen
+const APP_VERSION = '1.2.1'; // muss zu APP_VERSION in main.py passen
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -67,7 +67,7 @@ async function api(method, url, body) {
    Daten
    ===================================================================== */
 let D = { areas: [], boxes: [], cells: [], items: [], tags: [] };
-const M = { area: new Map(), box: new Map(), cell: new Map(), item: new Map(), tag: new Map() };
+const M = { area: new Map(), box: new Map(), cell: new Map(), item: new Map(), tag: new Map(), back: new Map() };
 const tagTerms = new Map();            // Label-ID -> Namen + Synonyme inkl. übergeordneter Labels
 let searchHits = new Set();           // 'cellId:slot' der Treffer in der Suchansicht
 let panelMode = null;                 // 'tags' = Label-Verwaltung
@@ -81,7 +81,7 @@ let multi = new Set();                // Mehrfachauswahl im Fach-Editor
 const expanded = new Set(store.get('expanded', []));
 
 const childAreas = pid => D.areas.filter(a => (a.parent_id ?? null) === pid).sort(byName);
-const areaBoxes = aid => D.boxes.filter(b => b.area_id === aid).sort(byName);
+const areaBoxes = aid => D.boxes.filter(b => b.area_id === aid && !b.pair_id).sort(byName);  // nur Vorderseiten
 const boxCells = bid => D.cells.filter(c => c.box_id === bid).sort((a, b) => a.row - b.row || a.col - b.col);
 const cellItems = cid => D.items.filter(i => i.cell_id === cid).sort(byName);
 const slotItems = (cid, s) => cellItems(cid).filter(i => (i.slot || 0) === s);
@@ -92,6 +92,12 @@ const edgesOf = f => f.reduce((a, x) => (a.push(a[a.length - 1] + x), a), [0]);
 const boxEdges = b => ({ X: edgesOf(fracs(b.col_w, b.cols)).map(e => e * b.width), Z: edgesOf(fracs(b.row_h, b.rows)).map(e => e * b.depth) });
 const isUniform = b => !(b.col_w || []).length && !(b.row_h || []).length;
 const realCells = bid => boxCells(bid).filter(c => !c.gap);
+// Doppelseitige Kästen: Rückseite (Seite B) = eigener Kasten mit pair_id -> Vorderseite (Seite A)
+const frontOf = b => (b.pair_id && M.box.get(b.pair_id)) || b;
+const sidesOf = b => { const f = frontOf(b), k = M.back.get(f.id); return k ? [f, k] : [f]; };
+const sideOf = b => b.pair_id ? 'B' : M.back.has(b.id) ? 'A' : '';
+const boxLabel = b => b.name + (sideOf(b) ? ` · Seite ${sideOf(b)}` : '');
+const boxSum = b => sidesOf(b).reduce((n, x) => n + (cnt.box.get(x.id) || 0), 0);
 const layoutOf = c => ({ id: c.id, row: c.row, col: c.col, rowspan: c.rowspan, colspan: c.colspan, label: c.label, gap: !!c.gap });
 let labelOpen = null;                 // Fach, bei dem das Namensfeld aufgeklappt ist
 
@@ -151,7 +157,7 @@ function areaPath(aid) {
 }
 function cellPath(c, slot) {
   const b = M.box.get(c.box_id);
-  return `${areaPath(b.area_id)} › ${b.name} › ${slot == null ? cellCode(c) : slotCode(c, slot)}`;
+  return `${areaPath(b.area_id)} › ${boxLabel(b)} › ${slot == null ? cellCode(c) : slotCode(c, slot)}`;
 }
 function descendants(aid) {
   const out = new Set([aid]);
@@ -163,6 +169,7 @@ function indexData() {
   for (const k in M) M[k].clear();
   D.areas.forEach(a => M.area.set(a.id, a));
   D.boxes.forEach(b => M.box.set(b.id, b));
+  D.boxes.forEach(b => { if (b.pair_id && M.box.has(b.pair_id)) M.back.set(b.pair_id, b); });
   D.cells.forEach(c => M.cell.set(c.id, c));
   D.items.forEach(i => M.item.set(i.id, i));
   D.tags = D.tags || [];
@@ -180,7 +187,7 @@ function indexData() {
   for (const c of D.cells) cnt.box.set(c.box_id, (cnt.box.get(c.box_id) || 0) + (cnt.cell.get(c.id) || 0));
   const total = id => {
     if (cnt.area.has(id)) return cnt.area.get(id);
-    let n = areaBoxes(id).reduce((s, b) => s + (cnt.box.get(b.id) || 0), 0);
+    let n = areaBoxes(id).reduce((s, b) => s + boxSum(b), 0);
     for (const k of childAreas(id)) n += total(k.id);
     cnt.area.set(id, n); return n;
   };
@@ -262,7 +269,7 @@ function renderTree() {
   roots.forEach(a => el.appendChild(areaNode(a, 0)));
 }
 
-function treeRow({ cls, icon, name, depth, caret, active, count, swatch }) {
+function treeRow({ cls, icon, name, depth, caret, active, count, swatch, sides }) {
   const row = document.createElement('div');
   row.className = `node ${cls}${active ? ' active' : ''}`;
   row.style.paddingLeft = (6 + depth * 16) + 'px';
@@ -271,6 +278,7 @@ function treeRow({ cls, icon, name, depth, caret, active, count, swatch }) {
     `<span class="ico">${ICON[icon]}</span>` +
     (swatch ? `<span class="swatch" style="background:${esc(swatch)}"></span>` : '') +
     `<span class="nm">${esc(name)}</span>` +
+    (sides ? '<span class="sides" title="Doppelseitig (Seite A und B)">A|B</span>' : '') +
     (count ? `<span class="cnt">${count}</span>` : '');
   return row;
 }
@@ -300,8 +308,8 @@ function areaNode(a, depth) {
 
 function boxNode(b, depth) {
   const row = treeRow({
-    cls: 'box', icon: 'box', name: b.name, depth, swatch: b.color,
-    active: sel.type === 'box' && sel.id === b.id, count: cnt.box.get(b.id),
+    cls: 'box', icon: 'box', name: b.name, depth, swatch: b.color, sides: M.back.has(b.id),
+    active: sel.type === 'box' && sidesOf(b).some(x => x.id === sel.id), count: boxSum(b),
   });
   row.onclick = () => select('box', b.id);
   row.ondblclick = () => renameBox(b.id);
@@ -372,6 +380,9 @@ async function addBox(areaId) {
       { name: 'orientation', label: 'Bauform', type: 'select', value: 'liegend', options: [
         { value: 'liegend', label: 'Sortierkasten (liegend, Blick von oben)' },
         { value: 'stehend', label: 'Regal / Magazin (stehend, Blick von vorne)' }] },
+      { name: 'sides', label: 'Seiten', type: 'select', value: '1', options: [
+        { value: '1', label: 'Einseitig' },
+        { value: '2', label: 'Doppelseitig (Rückseite mit gleichem Raster)' }] },
       { name: 'rows', label: 'Zeilen', type: 'number', value: 4, min: 1, max: 40, w: 'half' },
       { name: 'cols', label: 'Spalten', type: 'number', value: 6, min: 1, max: 40, w: 'half' },
       { name: 'width', label: 'Breite mm', type: 'number', value: 400, min: 1, w: 'third' },
@@ -380,10 +391,30 @@ async function addBox(areaId) {
     ], ok: 'Anlegen',
   });
   if (!r) return;
+  const { sides, ...rest } = r;
   const { id } = await api('POST', 'api/boxes', {
-    ...r, area_id: +r.area_id, rows: clamp(+r.rows || 1, 1, 40), cols: clamp(+r.cols || 1, 1, 40),
+    ...rest, area_id: +r.area_id, rows: clamp(+r.rows || 1, 1, 40), cols: clamp(+r.cols || 1, 1, 40),
     width: +r.width || 400, depth: +r.depth || 300, height: +r.height || 60,
     color: ['#3d6fa8', '#c2553b', '#5b8c4a', '#8a5bb5', '#c9a227', '#2e8b8b'][D.boxes.length % 6],
+  });
+  if (sides === '2') await api('POST', `api/boxes/${id}/back`, { copy_layout: true });
+  await reload(); select('box', id);
+}
+
+async function addBack(b) {
+  const r = await dialog({
+    title: `„${b.name}“ doppelseitig machen`,
+    text: 'Die Rückseite (Seite B) bekommt eigene Fächer und eigenen Inhalt. Name, Bereich, Maße und Farbe gelten für beide Seiten.',
+    fields: [
+      { name: 'copy', label: 'Fachaufteilung der Rückseite', type: 'select', value: '1', options: [
+        { value: '1', label: 'Wie Seite A übernehmen' }, { value: '0', label: 'Eigenes Raster' }] },
+      { name: 'rows', label: 'Zeilen (eigenes Raster)', type: 'number', value: b.rows, min: 1, max: 40, w: 'half' },
+      { name: 'cols', label: 'Spalten (eigenes Raster)', type: 'number', value: b.cols, min: 1, max: 40, w: 'half' },
+    ], ok: 'Rückseite anlegen',
+  });
+  if (!r) return;
+  const { id } = await api('POST', `api/boxes/${b.id}/back`, {
+    copy_layout: r.copy === '1', rows: clamp(+r.rows || 1, 1, 40), cols: clamp(+r.cols || 1, 1, 40),
   });
   await reload(); select('box', id);
 }
@@ -451,7 +482,7 @@ function renderAreaPanel(a) {
     <div class="sec"><div class="sec-title">Kästen hier</div>
       ${boxes.length ? `<div class="chips">${boxes.map(b => `<div class="chip" data-box="${b.id}">
         <span class="swatch" style="width:10px;height:10px;border-radius:3px;background:${esc(b.color)}"></span>${esc(b.name)}
-        <span class="cnt">${b.rows}×${b.cols} · ${cnt.box.get(b.id) || 0} Teile</span></div>`).join('')}</div>`
+        <span class="cnt">${M.back.has(b.id) ? '2 Seiten' : `${b.rows}×${b.cols}`} · ${boxSum(b)} Teile</span></div>`).join('')}</div>`
         : '<div class="no-items">Noch keine Kästen in diesem Bereich.</div>'}
     </div>
     <div class="sec"><button class="btn danger sm" id="a-del">Bereich löschen</button>
@@ -483,9 +514,13 @@ function renderBoxPanel(b) {
   const gapN = cells.filter(c => c.gap).length;
   const allGap = multiArr.length > 0 && multiArr.every(id => M.cell.get(id)?.gap);
   const tidyN = cells.filter(c => needsTidy(c)).length;
+  const sides = sidesOf(b), isBack = !!b.pair_id;
 
   panel.innerHTML = `
-    <div class="p-head"><div class="kicker">Kasten</div><h2>${esc(b.name)}</h2><div class="path">${esc(areaPath(b.area_id))}</div></div>
+    <div class="p-head"><div class="kicker">Kasten${sides.length > 1 ? ` · Seite ${sideOf(b)}` : ''}</div><h2>${esc(b.name)}</h2><div class="path">${esc(areaPath(b.area_id))}</div>
+      ${sides.length > 1 ? `<div class="side-sw">${sides.map(x => `<button class="${x.id === b.id ? 'on' : ''}" data-side="${x.id}">
+        Seite ${x.pair_id ? 'B' : 'A'}<span>${x.pair_id ? 'Rückseite' : 'Vorderseite'} · ${cnt.box.get(x.id) || 0}</span></button>`).join('')}</div>` : ''}
+    </div>
 
     <div class="sec" id="cell-sec">${cur ? cellSection(cur) : `<div class="sec-title">Fach</div><div class="no-items">Klick auf ein Fach in der 3D-Ansicht oder im Raster unten.</div>`}</div>
 
@@ -534,13 +569,18 @@ function renderBoxPanel(b) {
         <label class="field"><span>${st ? 'Höhe' : 'Tiefe'} mm</span><input id="b-d" type="number" min="1" value="${b.depth}"></label>
         <label class="field"><span>${st ? 'Fachtiefe' : 'Wandhöhe'} mm</span><input id="b-h" type="number" min="1" value="${b.height}"></label>
       </div>
-      <label class="field"><span>Notiz</span><textarea id="b-notes" rows="2">${esc(b.notes)}</textarea></label>
+      <label class="field"><span>Notiz${sides.length > 1 ? ` (Seite ${sideOf(b)})` : ''}</span><textarea id="b-notes" rows="2">${esc(b.notes)}</textarea></label>
+      ${sides.length > 1 ? `<div class="hint">Doppelseitig: Name, Bereich, Bauform, Farbe und Maße gelten für beide Seiten. Raster, Fächer, ${st ? 'Fachtiefe' : 'Wandhöhe'} und Inhalt hat jede Seite für sich.</div>`
+        : `<button class="btn sm" id="b-back">⇅ Rückseite anlegen (doppelseitig)</button>`}
     </div>
 
-    <div class="sec"><button class="btn danger sm" id="b-del">Kasten löschen</button></div>`;
+    <div class="sec">${isBack ? '<button class="btn danger sm" id="b-del">Rückseite entfernen</button>'
+      : `<button class="btn danger sm" id="b-del">Kasten löschen</button>${sides.length > 1 ? '<div class="hint">Löscht beide Seiten.</div>' : ''}`}</div>`;
 
   // Fach-Bereich
   if (cur) bindCellSection(cur);
+  panel.querySelectorAll('[data-side]').forEach(el => el.onclick = () => { if (+el.dataset.side !== b.id) select('box', +el.dataset.side); });
+  $('#b-back')?.addEventListener('click', () => addBack(b));
 
   // Raster
   panel.querySelectorAll('[data-cell]').forEach(el => el.onclick = e => setCell(+el.dataset.cell, e.shiftKey || e.ctrlKey || e.metaKey));
@@ -578,9 +618,12 @@ function renderBoxPanel(b) {
   $('#b-h').onchange = e => +e.target.value > 0 && patch({ height: +e.target.value });
   $('#b-notes').onchange = e => patch({ notes: e.target.value });
   $('#b-del').onclick = async () => {
-    const ok = await dialog({ title: `„${b.name}“ löschen?`, text: `Der Kasten und ${cnt.box.get(b.id) || 0} eingetragene Teile werden gelöscht.`, ok: 'Löschen', danger: true });
+    const ok = isBack
+      ? await dialog({ title: `Rückseite von „${b.name}“ entfernen?`, text: `Seite B und ${cnt.box.get(b.id) || 0} eingetragene Teile darauf werden gelöscht. Seite A bleibt.`, ok: 'Entfernen', danger: true })
+      : await dialog({ title: `„${b.name}“ löschen?`, text: `Der Kasten${sides.length > 1 ? ' (beide Seiten)' : ''} und ${boxSum(b)} eingetragene Teile werden gelöscht.`, ok: 'Löschen', danger: true });
     if (!ok) return;
     await api('DELETE', `api/boxes/${b.id}`);
+    if (isBack) { await reload(); select('box', b.pair_id); return; }
     sel = { type: 'area', id: b.area_id }; selCell = null; await reload(); writeHash();
   };
 }
@@ -824,7 +867,7 @@ function renderSearchPanel() {
     if (!byBox.has(c.box_id)) byBox.set(c.box_id, []);
     byBox.get(c.box_id).push(i);
   }
-  const boxes = [...byBox.keys()].map(id => M.box.get(id)).sort((a, b) => (areaPath(a.area_id) + a.name).localeCompare(areaPath(b.area_id) + b.name, 'de', { numeric: true }));
+  const boxes = [...byBox.keys()].map(id => M.box.get(id)).sort((a, b) => (areaPath(a.area_id) + boxLabel(a)).localeCompare(areaPath(b.area_id) + boxLabel(b), 'de', { numeric: true }));
   const t = sel.tag != null ? M.tag.get(sel.tag) : null;
   const kids = t ? tagKids(t.id) : [];
   panel.innerHTML = `
@@ -836,7 +879,7 @@ function renderSearchPanel() {
     ${kids.length ? `<div class="sec"><div class="sec-title">Genauer</div><div class="tags">${kids.map(k => tagChip(k.id)).join('')}</div></div>` : ''}
     ${boxes.length ? boxes.map(b => `
       <div class="sec">
-        <div class="sec-title"><span style="text-transform:none;letter-spacing:0;color:var(--fg);font-size:13px">${esc(b.name)}</span><span style="text-transform:none;letter-spacing:0">${esc(areaPath(b.area_id))}</span></div>
+        <div class="sec-title"><span style="text-transform:none;letter-spacing:0;color:var(--fg);font-size:13px">${esc(boxLabel(b))}</span><span style="text-transform:none;letter-spacing:0">${esc(areaPath(b.area_id))}</span></div>
         <div class="hits">${byBox.get(b.id).sort((x, y) => x.cell_id - y.cell_id || x.slot - y.slot).map(i => {
           const c = M.cell.get(i.cell_id);
           return `<div class="hit" data-hit="${i.id ?? ''}" data-hcell="${i.cell_id}"><span class="code">${slotCode(c, i.slot || 0)}</span>
@@ -1235,7 +1278,7 @@ function buildBox(b, showTitle) {
     footD = Dp + to; height = H + baseH;
   }
   if (showTitle) {
-    const sp = textSprite(b.name);
+    const sp = textSprite(boxLabel(b));
     const sh = clamp(Math.max(footW, height) * 0.075, 12, 70);
     sp.scale.set(sh * sp.userData.aspect, sh, 1);
     sp.position.set(0, height + sh * 0.9, b.orientation === 'stehend' ? footD / 2 : 0);
@@ -1254,8 +1297,8 @@ function render3D() {
   let boxes = [];
   searchHits = new Set();
   let hits = [];
-  if (sel.type === 'box' && M.box.has(sel.id)) boxes = [M.box.get(sel.id)];
-  else if (sel.type === 'area' && M.area.has(sel.id)) boxes = areaBoxes(sel.id);
+  if (sel.type === 'box' && M.box.has(sel.id)) boxes = sidesOf(M.box.get(sel.id));  // doppelseitig: beide Seiten nebeneinander
+  else if (sel.type === 'area' && M.area.has(sel.id)) boxes = areaBoxes(sel.id).flatMap(sidesOf);
   else if (sel.type === 'search') {
     hits = findItems(sel);
     const lc = findLabelCells(sel, hits);
@@ -1263,7 +1306,7 @@ function render3D() {
     lc.forEach(c => { for (let s = 0; s < slotCount(c); s++) searchHits.add(`${c.id}:${s}`); });
     hits = [...hits, ...lc];
     const ids = [...new Set([...hits.map(i => M.cell.get(i.cell_id ?? i.id).box_id)])];
-    boxes = ids.map(id => M.box.get(id)).sort((a, b) => (areaPath(a.area_id) + a.name).localeCompare(areaPath(b.area_id) + b.name, 'de', { numeric: true }));
+    boxes = ids.map(id => M.box.get(id)).sort((a, b) => (areaPath(a.area_id) + boxLabel(a)).localeCompare(areaPath(b.area_id) + boxLabel(b), 'de', { numeric: true }));
   }
 
   view2d.innerHTML = ''; boxes2d = [];
@@ -1312,9 +1355,9 @@ function setViewInfo(boxes, hits) {
   const info = $('#view-info');
   if (sel.type === 'search') {
     info.innerHTML = `<b>${esc(searchTitle())}</b> · ${hits.length} Treffer in ${boxes.length} ${boxes.length === 1 ? 'Kasten' : 'Kästen'} · Fach anklicken zum Öffnen`;
-  } else if (boxes.length === 1) {
-    const b = boxes[0];
-    info.innerHTML = `<b>${esc(b.name)}</b> · ${realCells(b.id).length} Fächer · ${cnt.box.get(b.id) || 0} Teile · ${b.width}×${b.depth}×${b.height} mm`;
+  } else if (sel.type === 'box') {
+    const b = M.box.get(sel.id);
+    info.innerHTML = `<b>${esc(boxLabel(b))}</b> · ${realCells(b.id).length} Fächer · ${cnt.box.get(b.id) || 0} Teile · ${b.width}×${b.depth}×${b.height} mm`;
   } else {
     info.innerHTML = `<b>${esc(M.area.get(sel.id).name)}</b> · ${boxes.length} Kästen · Fach anklicken zum Öffnen`;
   }
@@ -1345,7 +1388,7 @@ function render2D(boxes) {
       const label = c.label && (n > 1 || cellItems(c.id).length) ? `<div class="c2-lbl">${esc(c.label)}</div>` : '';
       return `<div class="c2${b.label_pos === 'oben' ? ' lbl-top' : ''}" style="${pos}">${label}<div class="c2-in" style="grid-template-columns:repeat(${c.sub_cols || 1},1fr);grid-template-rows:repeat(${c.sub_rows || 1},1fr)">${slots}</div></div>`;
     }).join('');
-    return `<div class="b2" data-box2="${b.id}">${multiBox ? `<div class="b2-title"><span class="swatch" style="background:${esc(b.color)}"></span>${esc(b.name)}</div>` : ''}
+    return `<div class="b2" data-box2="${b.id}">${multiBox ? `<div class="b2-title"><span class="swatch" style="background:${esc(b.color)}"></span>${esc(boxLabel(b))}</div>` : ''}
       <div class="b2-grid" style="--boxc:${esc(b.color)};grid-template-columns:${cw.map(f => `${(f * 100).toFixed(3)}fr`).join(' ')};grid-template-rows:${rh.map(f => `${(f * 100).toFixed(3)}fr`).join(' ')}">${cells}</div></div>`;
   }).join('');
   layout2D();
@@ -1395,7 +1438,7 @@ function update2D() {
 
 function tipHtml(c, slot) {
   const b = M.box.get(c.box_id), items = slotItems(c.id, slot);
-  return `<div class="h"><span>${slotCode(c, slot)}</span>${esc(c.label || b.name)}</div>` +
+  return `<div class="h"><span>${slotCode(c, slot)}</span>${esc(c.label || boxLabel(b))}</div>` +
     (items.length ? `<ul>${items.slice(0, 6).map(i => `<li><span>${esc(i.name)}</span>${i.qty ? ' · ' + esc(i.qty) : ''}${(i.links || []).length ? ' ' + i.links.map(l => LT[l.type]?.ico || '🔗').join('') : ''}${(i.tags || []).length ? `<div class="tags tip-tags">${i.tags.map(t => tagChip(t)).join('')}</div>` : ''}</li>`).join('')}${items.length > 6 ? `<li>… ${items.length - 6} weitere</li>` : ''}</ul>` : '<div style="color:var(--dim)">leer</div>');
 }
 function placeTip(e) {
@@ -1556,7 +1599,7 @@ function runSearch() {
     results.push({ k: 'Teil', t: i.name + (i.qty ? ` · ${i.qty}` : ''), s: cellPath(M.cell.get(i.cell_id), i.slot || 0), go: () => goCell(i.cell_id, i.slot || 0) });
   for (const c of lc)
     results.push({ k: 'Fach', t: c.label, s: cellPath(c), go: () => goCell(c.id) });
-  for (const b of D.boxes) if (match(b.name + ' ' + b.notes))
+  for (const b of D.boxes) if (!b.pair_id && match(b.name + ' ' + sidesOf(b).map(x => x.notes).join(' ')))
     results.push({ k: 'Kasten', t: b.name, s: areaPath(b.area_id), go: () => select('box', b.id) });
   for (const a of D.areas) if (match(a.name))
     results.push({ k: 'Bereich', t: a.name, s: areaPath(a.parent_id) || '', go: () => select('area', a.id) });
